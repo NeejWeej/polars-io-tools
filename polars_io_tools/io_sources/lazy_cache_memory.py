@@ -47,14 +47,33 @@ constructing a fresh ``cache_memory`` (a fresh call builds a fresh buffer), the 
 instance-scoped invalidation model as the success path.
 """
 
+import functools
+import operator
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 
 import polars as pl
 
-from .util import collect_lf_in_io_source, register_io_source_with_is_pure
+from .restrict_visitor import restrict_expr_to_columns
+from .util import PartitionKey, collect_lf_in_io_source, partition_key, register_io_source_with_is_pure
 
 __all__ = ("cache_memory",)
+
+# Sentinel returned by the build planner to mean "everything demanded is already
+# materialized" — distinct from ``None``, which means "do a full (unrestricted) build".
+_NOTHING = object()
+
+
+def _exclude_built(built_keys: set[PartitionKey]) -> pl.Expr | None:
+    """A predicate that excludes every already-built partition.
+
+    For each built partition key (a conjunction of ``col == value``), we exclude rows that
+    match it, then AND those exclusions together — i.e. "not in any already-built partition".
+    ``eq_missing`` is used so a null-valued partition key excludes exactly its own rows.
+    Returns ``None`` when nothing has been built yet (no restriction needed).
+    """
+    clauses = [~functools.reduce(operator.and_, (pl.col(col).eq_missing(value) for col, value in key)) for key in built_keys if key]
+    return functools.reduce(operator.and_, clauses) if clauses else None
 
 
 class _CachedBuildError(Exception):
@@ -72,6 +91,7 @@ def cache_memory(
     self_or_fn: pl.LazyFrame | Callable[[], pl.LazyFrame],
     *,
     schema: pl.Schema | Callable[[], pl.Schema],
+    partition_cols: str | Sequence[str] = (),
     description: str | None = None,
 ) -> pl.LazyFrame:
     """Collect a builder at most once into an in-memory buffer and replay it thereafter.
@@ -98,11 +118,21 @@ def cache_memory(
             A callable defers resolution until Polars needs it, so ``collect_schema()`` on
             the result never forces the builder to run — useful when the schema is derived
             from the builder's own lazy plan.
+        partition_cols (str | Sequence[str], default ()): Optional column or columns to
+            partition the buffer by. When set, a pushed predicate on the partition columns
+            limits which partitions are built, so a partition never demanded is never
+            materialized; a demand with no such predicate builds every partition. Each
+            build collects the (optionally partition-filtered) builder once, so a partition
+            is materialized at most once. Partition columns must be produced by the builder
+            but need not appear in ``schema``; those absent from ``schema`` are dropped from
+            the output and cannot be filtered on (Polars validates predicates against the
+            advertised schema). Across-partition row order is unspecified. Empty (default)
+            is identical to the single-buffer form.
         description (str | None, default None): Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
 
     Returns:
         pl.LazyFrame: A LazyFrame with ``schema``, backed by a generator over a one-time
-        materialization of the builder.
+        materialization of the builder (per partition when ``partition_cols`` is set).
 
     Raises:
         TypeError: If ``schema`` is neither a ``pl.Schema`` nor a callable.
@@ -110,17 +140,34 @@ def cache_memory(
             or a declared column's dtype does not match. Because the check runs inside the
             io_source generator, Polars surfaces it as
             :class:`polars.exceptions.ComputeError` at collect time (message preserved).
+            A build failure is terminal for the whole instance; retry by constructing a
+            fresh ``cache_memory``. A ``partition_cols`` entry absent from the constructed
+            frame likewise surfaces as ``ComputeError`` at build time.
     """
     if not isinstance(schema, pl.Schema) and not callable(schema):
         raise TypeError(f"cache_memory requires a pl.Schema or a callable, got {type(schema).__name__}")
 
+    partition_cols = (partition_cols,) if isinstance(partition_cols, str) else tuple(partition_cols)
+
     build_frame: Callable[[], pl.LazyFrame] = self_or_fn if callable(self_or_fn) else (lambda: self_or_fn)
 
-    buffer: pl.DataFrame | None = None
+    # Materialized buffers, one per partition, each already reconciled and projected to the
+    # declared schema. Without partition_cols there is exactly one key, the empty tuple ``()``.
+    buffers: dict[PartitionKey, pl.DataFrame] = {}
+    # Partition keys already materialized — used to subtract already-built partitions from a
+    # restricted build so each partition is collected at most once across the instance's lifetime.
+    built_keys: set[PartitionKey] = set()
+    # Restricted predicates already built. A repeated identical demand is served from buffers
+    # without re-collecting, matched by structural predicate equality (``Expr.meta.eq``).
+    built_predicates: list[pl.Expr] = []
+    # True once an unrestricted build has run: every partition is then known, so later demands
+    # (any predicate) are served from ``buffers`` without rebuilding.
+    full_built = False
     # A cached build failure, stored as a lightweight ``(exception_type_name, message)`` record
     # rather than the live exception object. Storing the object would pin its traceback — and
     # through it the whole failed DataFrame — alive for the instance's lifetime, and re-raising one
     # shared object grows its traceback on every collect. We re-raise a fresh neutral error instead.
+    # A failure is terminal for the whole instance.
     build_error: tuple[str, str] | None = None
     resolved_schema: pl.Schema | None = None
     building = False
@@ -138,12 +185,38 @@ def cache_memory(
                 resolved_schema = schema() if callable(schema) else schema
             return resolved_schema
 
-    def get_buffer() -> pl.DataFrame:
-        nonlocal buffer, building, build_error
+    def _plan_build(restricted_pred: pl.Expr | None):
+        """Decide what to build for a demand. Must be called while holding ``build_cond``.
+
+        Returns ``_NOTHING`` if everything demanded is already materialized (serve from
+        ``buffers``); ``None`` to do a full (unrestricted) build; or a predicate to build
+        just the not-yet-materialized partitions matching the demand.
+        """
+        if full_built:
+            return _NOTHING
+        if not partition_cols:
+            # Single-buffer fast path: () is the only key.
+            return _NOTHING if () in buffers else None
+        if restricted_pred is None:
+            # No usable partition predicate: we cannot know which partitions the demand needs,
+            # so we must build them all.
+            return None
+        if any(restricted_pred.meta.eq(built) for built in built_predicates):
+            return _NOTHING
+        # Subtract already-built partitions so each partition is collected at most once.
+        not_built = _exclude_built(built_keys)
+        return restricted_pred if not_built is None else restricted_pred & not_built
+
+    def get_partitions(restricted_pred: pl.Expr | None) -> list[pl.DataFrame]:
+        """Return the materialized partition buffers for a demand, building lazily as needed.
+
+        The partition predicate restricts *which* partitions are built (an optimization only);
+        row-level correctness is still enforced by re-applying the full predicate in
+        ``source_generator``, so returning a superset of buffers here is safe.
+        """
+        nonlocal full_built, building, build_error
         with build_cond:
             while True:
-                if buffer is not None:
-                    return buffer
                 if build_error is not None:
                     # The build ran once and failed; that outcome is terminal for this instance.
                     # Re-raise a fresh neutral error carrying the original type and message rather
@@ -151,8 +224,11 @@ def cache_memory(
                     # N re-runs of a failing builder. To retry, construct a fresh cache_memory.
                     type_name, message = build_error
                     raise _CachedBuildError(f"{type_name}: {message}")
+                todo = _plan_build(restricted_pred)
+                if todo is _NOTHING:
+                    return list(buffers.values())
                 if building:
-                    # Another thread is materializing the one build. Wait and share its outcome.
+                    # Another thread is running the one in-flight build. Wait and share its outcome.
                     build_cond.wait()
                     continue
                 # No outcome yet and nobody building: become the sole builder.
@@ -162,12 +238,18 @@ def cache_memory(
         # Build outside the condition lock so waiters can park on ``build_cond`` while this runs.
         # Only one thread ever reaches here (guarded by ``building`` + the terminal outcome above).
         try:
-            built = build_frame().collect()
+            lf = build_frame()
+            if todo is not None:
+                # Restricted build: filter the builder to just the demanded (not-yet-built) partitions.
+                lf = lf.filter(todo)
+            built = lf.collect()
             # Reconcile the materialized frame against the declared schema ONCE, here at build time.
             # The check is deliberately asymmetric: a missing declared column or a dtype mismatch
             # raises (either would silently corrupt results); an extra column is dropped by the
             # select below so the declared schema stays constant. Polars does not validate yielded
-            # frames against the declared schema, so this is the only safety net.
+            # frames against the declared schema, so this is the only safety net. Partition columns
+            # need not be declared; they are dropped from the stored buffers by the select below but
+            # must be present in ``built`` for the partition_by split.
             declared = get_schema()
             actual = built.schema
             for name in declared.names():
@@ -175,7 +257,13 @@ def cache_memory(
                     raise ValueError(f"cache_memory: declared column '{name}' is missing from the constructed frame")
                 if actual[name] != declared[name]:
                     raise ValueError(f"cache_memory: column '{name}' declared as {declared[name]} but constructed frame has {actual[name]}")
-            result = built.select(declared.names())
+            if partition_cols:
+                new_buffers = {}
+                for values, frame in built.partition_by(list(partition_cols), as_dict=True).items():
+                    key = partition_key(dict(zip(partition_cols, values)))
+                    new_buffers[key] = frame.select(declared.names())
+            else:
+                new_buffers = {(): built.select(declared.names())}
         except BaseException as exc:
             # Any build failure — an ordinary Exception (e.g. a data-quality raise) or a control-flow
             # BaseException (KeyboardInterrupt/SystemExit) — is terminal for this instance. Recording
@@ -198,10 +286,18 @@ def cache_memory(
             raise
 
         with build_cond:
-            buffer = result
+            for key, frame in new_buffers.items():
+                buffers.setdefault(key, frame)
+                built_keys.add(key)
+            if todo is None:
+                # An unrestricted build materialized every partition; short-circuit later demands.
+                full_built = True
+            elif restricted_pred is not None:
+                # Remember this demand so an identical repeat is served without re-collecting.
+                built_predicates.append(restricted_pred)
             building = False
             build_cond.notify_all()
-        return result
+        return list(buffers.values())
 
     def source_generator(
         with_columns: list[str] | None,
@@ -209,8 +305,17 @@ def cache_memory(
         n_rows: int | None,
         batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
-        # The buffer is already reconciled and projected to the declared schema (see get_buffer).
-        lf = get_buffer().lazy()
+        # Restrict the pushed predicate to the partition columns to prune which partitions we build.
+        restricted_pred = restrict_expr_to_columns(predicate, set(partition_cols)) if predicate is not None and partition_cols else None
+        # Each buffer is already reconciled and projected to the declared schema (see get_partitions).
+        parts = get_partitions(restricted_pred)
+        if len(parts) == 1:
+            buf = parts[0]
+        elif parts:
+            buf = pl.concat(parts, how="vertical")
+        else:
+            buf = pl.DataFrame(schema=get_schema())
+        lf = buf.lazy()
         if predicate is not None:
             lf = lf.filter(predicate)
 

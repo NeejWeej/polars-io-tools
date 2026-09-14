@@ -1,21 +1,18 @@
 import hashlib
 import logging
-from collections.abc import Hashable, Iterator, MutableMapping, Sequence
+from collections.abc import Iterator, MutableMapping, Sequence
 from typing import Any, Literal, NamedTuple
 
 import polars as pl
 
 from .dnf_visitor import _is_contradiction
 from .restrict_visitor import restrict_expr_to_columns
-from .util import register_io_source_with_is_pure
+from .util import PartitionKey as _PartitionKey, partition_key as _partition_key, register_io_source_with_is_pure
 
 log = logging.getLogger(__name__)
 
 
 __all__ = ("cache",)
-
-
-_PartitionKey = tuple[tuple[str, Any], ...]
 
 
 class _CacheKey(NamedTuple):
@@ -33,10 +30,6 @@ def _df_key(df: pl.LazyFrame, order_by: tuple[str, ...] = (), partition_cols: tu
     """Return a unique key for the given dataframe, ordering key and partition layout."""
     payload = df.serialize() + repr((tuple(order_by), tuple(partition_cols))).encode()
     return hashlib.md5(payload).hexdigest()
-
-
-def _partition_key(partition_values: dict[str, Hashable]) -> _PartitionKey:
-    return tuple(sorted(partition_values.items()))
 
 
 def _generate_expr(row: dict, schema: pl.Schema) -> pl.Expr:
