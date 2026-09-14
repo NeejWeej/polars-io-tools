@@ -1,4 +1,5 @@
 import datetime
+import gc
 import random
 import sys
 import time
@@ -21,17 +22,39 @@ _ray_cancel_flaky_on_windows = pytest.mark.skipif(
     reason="Ray task cancellation on early source termination can crash the interpreter on Windows (Ray Windows support is beta).",
 )
 
+# Cap Ray's plasma object store and tolerate re-init. CI containers default to a tiny
+# /dev/shm (~64MB), so an uncapped object store over-allocates and OOM-kills workers,
+# crashing the suite mid-run.
+_RAY_INIT_KWARGS = {"num_cpus": 2, "object_store_memory": 200 * 1024 * 1024, "ignore_reinit_error": True}
+
 
 @pytest.fixture(scope="session", autouse=True)
 def shared_ray_cluster():
     """
-    Start a tiny local-mode Ray cluster once for all
-    tests and shut it down at the end of the session.
+    Start a tiny Ray cluster once for all tests and shut it down at the end of the session.
     """
     if not ray.is_initialized():
-        ray.init(num_cpus=2)
+        ray.init(**_RAY_INIT_KWARGS)
     yield
     ray.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def _gc_after_test():
+    """Force garbage collection after each test.
+
+    Ray task/actor references linger via cyclic references and traceback locals
+    (``sys.last_traceback`` and friends), so their processes and object-store memory
+    accumulate across this file's many Ray tests until a worker is OOM-killed in CI.
+    Reclaiming eagerly between tests keeps the footprint bounded.
+    """
+    yield
+    for attr in ("last_traceback", "last_value", "last_type"):
+        try:
+            delattr(sys, attr)
+        except AttributeError:
+            pass
+    gc.collect()
 
 
 def generate_sample_lazyframe(start: datetime.datetime, end: datetime.datetime) -> pl.LazyFrame:
@@ -206,7 +229,7 @@ def test_no_ray():
         )
 
     # Re-initialize Ray for subsequent tests
-    ray.init(num_cpus=2)
+    ray.init(**_RAY_INIT_KWARGS)
 
 
 class TestPartitionPruning:
