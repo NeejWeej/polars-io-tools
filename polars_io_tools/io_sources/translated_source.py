@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Literal
 
-import orjson
 import polars as pl
 from pydantic import BaseModel
 
@@ -278,11 +278,11 @@ def mapping_to_metadata(mapping: dict[str, pl.DataType]) -> bytes:
         tz = getattr(dt, "time_zone", None)
         cols[name] = LogicalSpec(dtype=ed, unit=unit, time_zone=tz)
     model = LogicalMappingMetadata(version=1, columns=cols)
-    return orjson.dumps(model.model_dump())
+    return json.dumps(model.model_dump(mode="json")).encode()
 
 
 def metadata_to_mapping(meta_bytes: bytes) -> dict[str, pl.DataType]:
-    data = orjson.loads(meta_bytes)
+    data = json.loads(meta_bytes)
     model = LogicalMappingMetadata.model_validate(data)
     cols: dict[str, pl.DataType] = {}
     for name, spec in model.columns.items():

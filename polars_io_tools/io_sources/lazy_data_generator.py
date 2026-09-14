@@ -3,12 +3,16 @@ from collections.abc import Callable, Iterator
 from datetime import date, timedelta
 from typing import Any
 
-import numpy as np
-import numpy.typing as npt
-import pandas as pd
 import polars as pl
 
-from .util import register_io_source_with_is_pure
+from .util import optional_deps_error, register_io_source_with_is_pure
+
+try:
+    import numpy as np
+    import numpy.typing as npt
+    import pandas as pd
+except ImportError as exc:
+    raise optional_deps_error("synthetic data generators") from exc
 
 __all__ = ("scan_synthetic_panel", "scan_synthetic_regression")
 

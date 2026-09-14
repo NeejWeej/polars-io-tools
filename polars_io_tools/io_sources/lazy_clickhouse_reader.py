@@ -1,15 +1,20 @@
 import logging
 
 import polars as pl
-import pyarrow as pa
-import requests
-from sqlglot import parse_one
+
+from .util import optional_deps_error, register_io_source_with_is_pure
+
+try:
+    import pyarrow as pa
+    import requests
+    from sqlglot import parse_one
+except ImportError as exc:
+    raise optional_deps_error("ClickHouse support") from exc
 
 from .sql_utils import (
     apply_polars_io_source_exprs,
     fix_three_part_identifiers,
 )
-from .util import register_io_source_with_is_pure
 
 __all__ = ("scan_clickhouse",)
 

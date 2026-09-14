@@ -6,10 +6,8 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import cloudpickle
 import polars as pl
 import polars.selectors as cs
-from tqdm import tqdm
 
 from .partitions import (
     KeyPartitions,
@@ -23,14 +21,14 @@ from .partitions import (
     discrete_partitions,
     retained_columns,
 )
+from .util import optional_deps_error, register_io_source_with_is_pure
 
 try:
+    import cloudpickle
     import ray
-except ImportError:
-    raise ImportError("The `execute_on_ray` function requires the `ray` package. Please install it with `pip install ray`.")
-
-
-from .util import register_io_source_with_is_pure
+    from tqdm import tqdm
+except ImportError as exc:
+    raise optional_deps_error("Ray execution") from exc
 
 # As we did in the `lazy_parquet_cache` module, we expose the functions to users, in case
 # they want to use them directly or though Polars' `.pipe()` syntax; however, the canonical

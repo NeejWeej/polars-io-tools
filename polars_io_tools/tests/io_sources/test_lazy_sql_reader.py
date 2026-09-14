@@ -15,6 +15,7 @@ from sqlglot import exp, parse_one
 
 import polars_io_tools as cpl
 from polars_io_tools import io_sources as polars_utils
+from polars_io_tools.io_sources import lazy_sql_reader  # noqa: F401  (ensures polars_utils.lazy_sql_reader is importable for monkeypatching)
 from polars_io_tools.io_sources.base import BinaryExprNode, ColumnNode, FunctionNode, LiteralNode, get_parsed_expr
 from polars_io_tools.io_sources.enum import BooleanFunctionType, OperatorType, TemporalFunctionType
 from polars_io_tools.io_sources.sql_dialects import MSSQL

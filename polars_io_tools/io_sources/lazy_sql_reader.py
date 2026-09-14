@@ -8,17 +8,22 @@ from functools import lru_cache
 from typing import Any
 
 import polars as pl
-from sqlglot import exp, parse_one
-from sqlglot.dialects.dialect import Dialect
 
 from .partitions import Partitioner, ReadPartition, as_partition_list, retained_columns
+from .util import optional_deps_error, register_io_source_with_is_pure
+
+try:
+    from sqlglot import exp, parse_one
+    from sqlglot.dialects.dialect import Dialect
+except ImportError as exc:
+    raise optional_deps_error("SQL support") from exc
+
 from .sql_dialects import MSSQL
 from .sql_utils import (
     apply_polars_io_source_exprs,
     fix_three_part_identifiers,
     wrap_query_with_casts,
 )
-from .util import register_io_source_with_is_pure
 
 __all__ = ("scan_db",)
 
@@ -136,7 +141,13 @@ def _has_top_level_order(parsed: exp.Expression) -> bool:
 
 @lru_cache(None)
 def get_sqlglot_dialect_odbc(conn_string: str) -> str | type[Dialect] | None:
-    import pyodbc
+    # pyodbc is imported inside the function (not the module-level guard) because importing
+    # it fails at runtime on systems without the unixODBC system library, even when the
+    # wheel is installed. Keeping it here means `import lazy_sql_reader` stays importable.
+    try:
+        import pyodbc
+    except ImportError as exc:
+        raise optional_deps_error("SQL support") from exc
 
     DIALECT_MAP: dict[str, str | type[Dialect]] = {
         "microsoft sql server": MSSQL,
@@ -177,7 +188,10 @@ def get_schema_from_query_odbc(
     """
 
     try:
-        from arrow_odbc import read_arrow_batches_from_odbc
+        try:
+            from arrow_odbc import read_arrow_batches_from_odbc
+        except ImportError as exc:
+            raise optional_deps_error("SQL support") from exc
 
         # Create connection string if not already a string
         conn_string = connection if isinstance(connection, str) else str(connection)
@@ -336,7 +350,10 @@ def scan_db(
         return final_query_expr.transform(fix_three_part_identifiers).sql(dialect=dialect)
 
     def _read(sql: str, batch_size: int | None):
-        from arrow_odbc import read_arrow_batches_from_odbc
+        try:
+            from arrow_odbc import read_arrow_batches_from_odbc
+        except ImportError as exc:
+            raise optional_deps_error("SQL support") from exc
 
         return read_arrow_batches_from_odbc(
             query=sql,

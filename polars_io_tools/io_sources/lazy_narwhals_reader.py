@@ -4,16 +4,20 @@ import logging
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, cast, overload
 
-import narwhals as nw
 import polars as pl
-from narwhals.typing import FrameT
-
-if TYPE_CHECKING:
-    import pyarrow as pa
 
 from .base import AliasNode, BaseExprNode, BinaryExprNode, CastNode, ColumnNode, ExprVisitor, FunctionNode, LiteralNode, get_parsed_expr
 from .enum import BooleanFunctionType, OperatorType
-from .util import collect_lf_in_io_source, register_io_source_with_is_pure
+from .util import collect_lf_in_io_source, optional_deps_error, register_io_source_with_is_pure
+
+try:
+    import narwhals as nw
+    from narwhals.typing import FrameT
+except ImportError as exc:
+    raise optional_deps_error("narwhals support") from exc
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 __all__ = ("from_narwhals",)
 

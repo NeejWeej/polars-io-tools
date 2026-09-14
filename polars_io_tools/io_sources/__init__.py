@@ -6,58 +6,100 @@ import polars as pl
 
 from .base import *
 from .concat_named import *
-from .delta_io import *
 from .join import *
 from .lazy_cache import cache, cache as _lazy_cache
 from .lazy_cache_memory import *
 from .lazy_cache_parquet import *
-from .lazy_clickhouse_reader import *
-from .lazy_clickhouse_writer import *
-from .lazy_data_generator import *
 from .lazy_datadog_reader import *
 from .lazy_debug import debug, debug as _lazy_debug
 from .lazy_iter_rows import *
-from .lazy_narwhals_reader import *
 from .lazy_probe import probe, probe as _lazy_probe
-from .lazy_sql_reader import *
 from .partitions import *
 from .pushdown_combine import *
 from .pushdown_pivot import *
 from .pushdown_unpivot import *
-from .sql_dialects import *
 from .translated_source import *
 from .ts import *
 from .util import *
 
+# These entry points are backed by heavy optional dependencies, so their modules
+# are not imported at package load time. Each is a thin delegator that imports its
+# module on first call; the TYPE_CHECKING imports give type checkers real signatures.
 if TYPE_CHECKING:
-    # These names are provided at runtime by the `from .X import *` star imports above.
-    # This block re-declares them so static analysis can resolve the targets passed to
-    # `@functools.wraps(...)` on the PIOTOperations methods below. TC004 is suppressed
-    # because ruff cannot see that the star imports already satisfy the runtime use.
-    from .delta_io import sink_delta as sink_delta  # noqa: TC004
-    from .join import filtered_join, filtered_join_asof  # noqa: TC004
+    from .delta_io import scan_delta, sink_delta
     from .lazy_clickhouse_reader import scan_clickhouse
-    from .lazy_clickhouse_writer import sink_clickhouse  # noqa: TC004
+    from .lazy_clickhouse_writer import sink_clickhouse
     from .lazy_data_generator import scan_synthetic_panel, scan_synthetic_regression
+    from .lazy_narwhals_reader import from_narwhals
+    from .lazy_sql_reader import scan_db
+else:
+
+    def scan_db(*args, **kwargs):
+        from .lazy_sql_reader import scan_db as _f
+
+        return _f(*args, **kwargs)
+
+    def scan_clickhouse(*args, **kwargs):
+        from .lazy_clickhouse_reader import scan_clickhouse as _f
+
+        return _f(*args, **kwargs)
+
+    def sink_clickhouse(*args, **kwargs):
+        from .lazy_clickhouse_writer import sink_clickhouse as _f
+
+        return _f(*args, **kwargs)
+
+    def scan_synthetic_panel(*args, **kwargs):
+        from .lazy_data_generator import scan_synthetic_panel as _f
+
+        return _f(*args, **kwargs)
+
+    def scan_synthetic_regression(*args, **kwargs):
+        from .lazy_data_generator import scan_synthetic_regression as _f
+
+        return _f(*args, **kwargs)
+
+    def from_narwhals(*args, **kwargs):
+        from .lazy_narwhals_reader import from_narwhals as _f
+
+        return _f(*args, **kwargs)
+
+    def scan_delta(*args, **kwargs):
+        from .delta_io import scan_delta as _f
+
+        return _f(*args, **kwargs)
+
+    def sink_delta(*args, **kwargs):
+        from .delta_io import sink_delta as _f
+
+        return _f(*args, **kwargs)
+
+
+if TYPE_CHECKING:
+    # Resolve the @functools.wraps(...) targets on the PIOTOperations methods for static
+    # analysis. Most targets are provided at runtime by the `from .X import *` star imports
+    # above and are re-declared here so type checkers can see them (TC004 suppressed). The
+    # three lazily-imported targets (execute_on_ray, sink_clickhouse, sink_delta) resolve to
+    # the real functions here but to no-op stubs at runtime, so wraps can run at class-
+    # definition time without importing their optional dependencies.
+    from .delta_io import sink_delta as _sink_delta_proto
+    from .join import filtered_join, filtered_join_asof  # noqa: TC004
+    from .lazy_clickhouse_writer import sink_clickhouse as _sink_clickhouse_proto
     from .lazy_iter_rows import iter_rows  # noqa: TC004
+    from .lazy_ray import execute_on_ray as _execute_on_ray_proto
     from .partitions import KeyPartitions, ReadPartition, by_key, by_range, by_time, by_value
     from .pushdown_combine import FilterSpec, pushdown_combine
     from .pushdown_pivot import pushdown_pivot
     from .pushdown_unpivot import pushdown_unpivot
     from .ts import ts_with_columns  # noqa: TC004
     from .util import filter_no_pushdown, with_columns_topo  # noqa: TC004
-
-if TYPE_CHECKING:
-    # We don't want to import `execute_on_ray` at the top level; however
-    # we also can't import it *inside* the execute_on_ray method of the
-    # PIOTOperations class, because thit needs to be defined at the module level
-    # for the `functools.wraps` decorator to work. That's why we use a stub here.
-    from .lazy_ray import (
-        execute_on_ray as _execute_on_ray_proto,
-    )
 else:
 
     def _execute_on_ray_proto(*_a, **_kw): ...
+
+    def _sink_clickhouse_proto(*_a, **_kw): ...
+
+    def _sink_delta_proto(*_a, **_kw): ...
 
 
 @pl.api.register_lazyframe_namespace("piot")
@@ -101,9 +143,9 @@ class PIOTOperations:
     @functools.wraps(_execute_on_ray_proto)
     def execute_on_ray(self, *args, **kwargs) -> pl.LazyFrame:
         # heavy import happens only when the user calls the method
-        from .lazy_ray import execute_on_ray as _execute_on_ray
+        from .lazy_ray import execute_on_ray
 
-        return _execute_on_ray(self._lf, *args, **kwargs)
+        return execute_on_ray(self._lf, *args, **kwargs)
 
     @functools.wraps(filtered_join_asof)
     def filtered_join_asof(self, *args, **kwargs) -> pl.LazyFrame:
@@ -127,12 +169,18 @@ class PIOTOperations:
     def with_columns_topo(self, *args, **kwargs) -> pl.LazyFrame:
         return with_columns_topo(self._lf, *args, **kwargs)
 
-    @functools.wraps(sink_delta)
+    @functools.wraps(_sink_delta_proto)
     def sink_delta(self, *args, **kwargs):
+        # heavy import happens only when the user calls the method
+        from .delta_io import sink_delta
+
         return sink_delta(self._lf, *args, **kwargs)
 
-    @functools.wraps(sink_clickhouse)
+    @functools.wraps(_sink_clickhouse_proto)
     def sink_clickhouse(self, *args, **kwargs):
+        # heavy import happens only when the user calls the method
+        from .lazy_clickhouse_writer import sink_clickhouse
+
         return sink_clickhouse(self._lf, *args, **kwargs)
 
     @functools.wraps(iter_rows)

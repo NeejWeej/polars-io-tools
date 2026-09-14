@@ -1,7 +1,7 @@
+import json
 import math
 from datetime import UTC, date, datetime, time, timedelta
 
-import orjson
 import polars as pl
 import pytest
 from packaging import version
@@ -963,7 +963,7 @@ def test_list_eval():
         assert "serialization not supported for this 'opaque' function" in node.error
     else:
         val = expr.meta.serialize(format="json")
-        val_dict = orjson.loads(val)
+        val_dict = json.loads(val)
         assert len(val_dict) == 1 and "Eval" in val_dict
         # TODO: Support parsing this node type
 
