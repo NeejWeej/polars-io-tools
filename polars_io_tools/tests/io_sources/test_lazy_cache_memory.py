@@ -9,6 +9,7 @@ import polars as pl
 import pytest
 from polars.exceptions import ComputeError
 from polars.io.plugins import register_io_source
+from polars.testing import assert_frame_equal
 
 from polars_io_tools.io_sources import cache_memory
 from polars_io_tools.io_sources.util import collect_lf_in_io_source, register_io_source_with_is_pure
@@ -69,6 +70,21 @@ class TestCacheMemory(unittest.TestCase):
     @staticmethod
     def _frame() -> pl.LazyFrame:
         return pl.LazyFrame({"a": pl.Series([1, 2], dtype=pl.Int64), "b": ["x", "y"]})
+
+    @staticmethod
+    def _pframe() -> pl.LazyFrame:
+        """A frame with a partition column ``region`` (two partitions) plus id/value columns."""
+        return pl.LazyFrame(
+            {
+                "region": ["us", "us", "eu", "eu"],
+                "id": [1, 2, 3, 4],
+                "v": [10, 20, 30, 40],
+            }
+        )
+
+    @staticmethod
+    def _pschema() -> pl.Schema:
+        return pl.Schema({"region": pl.String, "id": pl.Int64, "v": pl.Int64})
 
     def test_collects_once_across_n_references(self):
         """The upstream is scanned exactly once even when the frame is referenced N times.
@@ -472,3 +488,237 @@ class TestCacheMemory(unittest.TestCase):
         lf.collect()
 
         self.assertEqual(len(calls), 1)
+
+    # ------------------------------------------------------------------
+    # Partitioning (partition_cols) — lazy per-partition build.
+    # ------------------------------------------------------------------
+
+    def test_no_partition_cols_unchanged(self):
+        """An explicit empty ``partition_cols`` still collapses N references to one scan.
+
+        Guards the single-buffer fast path: the partitioned code must be byte-for-byte
+        equivalent to today when no partition columns are given.
+        """
+        scans: list = []
+        frame = self._frame()
+        lf = cache_memory(lambda: _counting_source(frame, scans), schema=frame.collect_schema(), partition_cols=())
+
+        pl.concat([lf, lf], how="vertical").collect()
+        lf.collect()
+
+        self.assertEqual(len(scans), 1)
+
+    def test_partition_predicate_restricts_build(self):
+        """A predicate on a partition column builds only the matching partition.
+
+        Demanding ``region == "us"`` collects only the ``us`` rows; a later ``eu`` demand
+        triggers a second build. The builder is called twice total — once per demanded
+        partition — never once per partition value.
+        """
+        calls: list = []
+
+        def build():
+            calls.append(1)
+            return self._pframe()
+
+        lf = cache_memory(build, schema=self._pschema(), partition_cols="region")
+
+        us = lf.filter(pl.col("region") == "us").sort("id").collect()
+        self.assertEqual(us["v"].to_list(), [10, 20])
+        self.assertEqual(len(calls), 1)
+
+        eu = lf.filter(pl.col("region") == "eu").sort("id").collect()
+        self.assertEqual(eu["v"].to_list(), [30, 40])
+        self.assertEqual(len(calls), 2)
+
+        # A repeat of an already-built partition does not rebuild.
+        lf.filter(pl.col("region") == "us").collect()
+        self.assertEqual(len(calls), 2)
+
+    def test_full_build_when_no_partition_predicate(self):
+        """A demand with no partition predicate full-builds once; later demands never rebuild."""
+        calls: list = []
+
+        def build():
+            calls.append(1)
+            return self._pframe()
+
+        lf = cache_memory(build, schema=self._pschema(), partition_cols="region")
+
+        # No partition predicate -> full build of every partition.
+        self.assertEqual(lf.select(pl.col("v").sum()).collect().item(), 100)
+        self.assertEqual(len(calls), 1)
+
+        # A later partition-restricted demand is served from buffers (full_built short-circuit).
+        lf.filter(pl.col("region") == "us").collect()
+        self.assertEqual(len(calls), 1)
+
+    def test_partitioned_result_correct(self):
+        """Partitioned results match the equivalent un-cached filter (order-insensitive)."""
+        frame = self._pframe()
+        lf = cache_memory(lambda: self._pframe(), schema=self._pschema(), partition_cols="region")
+
+        eu = lf.filter(pl.col("region") == "eu").sort("id").collect()
+        assert_frame_equal(eu, frame.filter(pl.col("region") == "eu").sort("id").collect())
+
+        all_rows = lf.sort("id").collect()
+        assert_frame_equal(all_rows, frame.sort("id").collect())
+
+    def test_partition_col_not_in_declared_schema(self):
+        """A partition column absent from the declared schema is dropped from the buffers.
+
+        The builder must still produce the partition column (it drives ``partition_by``),
+        but it is dropped from the stored buffers so they match the declared schema. Such a
+        column cannot be filtered on downstream (Polars validates predicates against the
+        advertised schema), so a full build is the usable path.
+        """
+        declared = pl.Schema({"id": pl.Int64, "v": pl.Int64})  # region omitted
+        lf = cache_memory(lambda: self._pframe(), schema=declared, partition_cols="region")
+
+        out = lf.sort("id").collect()
+        self.assertEqual(out.columns, ["id", "v"])
+        self.assertEqual(out["v"].to_list(), [10, 20, 30, 40])
+
+    def test_null_valued_partition_incremental_builds(self):
+        """A null-valued partition builds and serves independently of non-null partitions.
+
+        The build subtraction must use null-safe equality: excluding a non-null partition
+        must not filter out the null partition (and vice versa), which naive ``col == value``
+        would, since ``col == None`` is null under three-valued logic.
+        """
+
+        def src():
+            return pl.LazyFrame({"g": ["a", None, "a", None], "v": [1, 2, 3, 4]})
+
+        schema = pl.Schema({"g": pl.String, "v": pl.Int64})
+
+        # Non-null partition first, then the null partition: the null rows must still build.
+        lf = cache_memory(src, schema=schema, partition_cols="g")
+        self.assertEqual(lf.filter(pl.col("g") == "a").sort("v").collect()["v"].to_list(), [1, 3])
+        self.assertEqual(lf.filter(pl.col("g").is_null()).sort("v").collect()["v"].to_list(), [2, 4])
+
+        # Null partition first, then a non-null demand: the non-null rows must not be poisoned.
+        lf2 = cache_memory(src, schema=schema, partition_cols="g")
+        self.assertEqual(lf2.filter(pl.col("g").is_null()).sort("v").collect()["v"].to_list(), [2, 4])
+        self.assertEqual(lf2.filter(pl.col("g") == "a").sort("v").collect()["v"].to_list(), [1, 3])
+
+    def test_str_partition_cols_normalized(self):
+        """A bare-string ``partition_cols`` behaves identically to a one-element sequence."""
+        lf_str = cache_memory(lambda: self._pframe(), schema=self._pschema(), partition_cols="region")
+        lf_seq = cache_memory(lambda: self._pframe(), schema=self._pschema(), partition_cols=["region"])
+
+        assert_frame_equal(
+            lf_str.filter(pl.col("region") == "us").sort("id").collect(),
+            lf_seq.filter(pl.col("region") == "us").sort("id").collect(),
+        )
+
+    def test_partition_cols_order_insensitive(self):
+        """``partition_cols`` is order-independent (sorted internally, matching ``cache``)."""
+
+        def src():
+            return pl.LazyFrame({"r": ["us", "us", "eu"], "z": ["a", "b", "a"], "v": [1, 2, 3]})
+
+        schema = pl.Schema({"r": pl.String, "z": pl.String, "v": pl.Int64})
+        lf_ab = cache_memory(src, schema=schema, partition_cols=["r", "z"])
+        lf_ba = cache_memory(src, schema=schema, partition_cols=["z", "r"])
+
+        assert_frame_equal(
+            lf_ab.filter(pl.col("r") == "us").sort("v").collect(),
+            lf_ba.filter(pl.col("r") == "us").sort("v").collect(),
+        )
+
+    def test_count_only_query_partitioned(self):
+        """A count-only query over a partitioned instance returns the true total row count."""
+        lf = cache_memory(lambda: self._pframe(), schema=self._pschema(), partition_cols="region")
+
+        self.assertEqual(lf.select(pl.len()).collect().item(), 4)
+
+    def test_partitioned_collects_builder_once_per_build(self):
+        """N references to the same partition subset in one plan yield one upstream scan.
+
+        The CSE-collapse guarantee still holds per build when partitioning.
+        """
+        scans: list = []
+        frame = self._pframe()
+        lf = cache_memory(
+            lambda: _counting_source(frame, scans),
+            schema=self._pschema(),
+            partition_cols="region",
+        )
+
+        branch = lf.filter(pl.col("region") == "us")
+        pl.concat([branch, branch], how="vertical").collect()
+
+        self.assertEqual(len(scans), 1)
+
+    def test_failed_build_terminal_partitioned(self):
+        """A failing build is terminal for the whole partitioned instance and re-raised.
+
+        Matches the unpartitioned contract: one build attempt, the cached failure re-raised
+        on every subsequent demand (any partition).
+        """
+        state = {"calls": 0}
+
+        def build():
+            state["calls"] += 1
+            raise ValueError("boom")
+
+        lf = cache_memory(build, schema=self._pschema(), partition_cols="region")
+
+        with pytest.raises(ComputeError, match="boom"):
+            lf.filter(pl.col("region") == "us").collect()
+        with pytest.raises(ComputeError, match="boom"):
+            lf.filter(pl.col("region") == "eu").collect()
+
+        self.assertEqual(state["calls"], 1)
+
+    def test_failed_build_not_amplified_across_collect_all_partitioned(self):
+        """A failing build runs once across a partitioned collect_all fan-out, not once per branch."""
+        attempts: list = []
+
+        def build():
+            attempts.append(1)
+            raise ValueError("boom")
+
+        lf = cache_memory(build, schema=self._pschema(), partition_cols="region")
+        regions = ["us", "eu"] * 32
+        branches = [lf.filter(pl.col("region") == r) for r in regions]
+
+        with pytest.raises(ComputeError, match="boom"):
+            pl.collect_all(branches)
+
+        self.assertEqual(len(attempts), 1)
+
+    def test_partition_buffers_released_when_frame_dropped(self):
+        """Per-partition buffers are reclaimed by GC once the returned frame is dropped.
+
+        The dict-of-buffers state lives only in the returned frame's closure, so a sentinel
+        embedded in a materialized partition must be weakref-dead after the frame is dropped.
+        """
+
+        class Sentinel:
+            pass
+
+        holder: dict = {}
+
+        def build():
+            sentinel = Sentinel()
+            holder["ref"] = weakref.ref(sentinel)
+            return pl.DataFrame(
+                {"region": ["us", "eu"], "a": [1, 2], "obj": [sentinel, sentinel]},
+                schema={"region": pl.String, "a": pl.Int64, "obj": pl.Object},
+            ).lazy()
+
+        lf = cache_memory(
+            build,
+            schema=pl.Schema({"region": pl.String, "a": pl.Int64, "obj": pl.Object}),
+            partition_cols="region",
+        )
+        lf.collect()  # full build materializes the partition buffers holding the sentinel
+
+        self.assertIsNotNone(holder["ref"](), "sentinel should be alive while the frame is held")
+
+        del lf
+        gc.collect()
+
+        self.assertIsNone(holder["ref"](), "partition buffers must be released once the frame is dropped")

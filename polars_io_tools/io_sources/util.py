@@ -5,10 +5,10 @@ import inspect
 import logging
 import os
 import socket
-from collections.abc import Iterator
+from collections.abc import Hashable, Iterator
 from datetime import date, datetime, timedelta
 from graphlib import TopologicalSorter
-from typing import NamedTuple
+from typing import Any, NamedTuple
 from urllib.parse import parse_qs, urlparse
 
 import polars as pl
@@ -20,14 +20,28 @@ from .._compat import POLARS_HAS_COLLECT_BATCHES
 log = logging.getLogger(__name__)
 
 __all__ = (
+    "PartitionKey",
     "collect_lf_in_io_source",
     "extract_description_block",
     "filter_no_pushdown",
     "inject_description_block",
+    "partition_key",
     "register_io_source_with_is_pure",
     "with_columns_topo",
     "wrap_io_source_with_error_catching",
 )
+
+# A partition identified by its (column, value) pairs, sorted so the key is order-independent.
+PartitionKey = tuple[tuple[str, Any], ...]
+
+
+def partition_key(partition_values: dict[str, Hashable]) -> PartitionKey:
+    """Build a :data:`PartitionKey` from a mapping of partition column to value.
+
+    The pairs are sorted by column name so keys built from the same values are equal
+    regardless of insertion order, making the result usable as a dict key or set member.
+    """
+    return tuple(sorted(partition_values.items()))
 
 
 def collect_lf_in_io_source(
