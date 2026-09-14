@@ -612,6 +612,21 @@ class TestCacheMemory(unittest.TestCase):
             lf_seq.filter(pl.col("region") == "us").sort("id").collect(),
         )
 
+    def test_partition_cols_order_insensitive(self):
+        """``partition_cols`` is order-independent (sorted internally, matching ``cache``)."""
+
+        def src():
+            return pl.LazyFrame({"r": ["us", "us", "eu"], "z": ["a", "b", "a"], "v": [1, 2, 3]})
+
+        schema = pl.Schema({"r": pl.String, "z": pl.String, "v": pl.Int64})
+        lf_ab = cache_memory(src, schema=schema, partition_cols=["r", "z"])
+        lf_ba = cache_memory(src, schema=schema, partition_cols=["z", "r"])
+
+        assert_frame_equal(
+            lf_ab.filter(pl.col("r") == "us").sort("v").collect(),
+            lf_ba.filter(pl.col("r") == "us").sort("v").collect(),
+        )
+
     def test_count_only_query_partitioned(self):
         """A count-only query over a partitioned instance returns the true total row count."""
         lf = cache_memory(lambda: self._pframe(), schema=self._pschema(), partition_cols="region")

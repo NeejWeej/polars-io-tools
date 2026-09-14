@@ -123,11 +123,14 @@ def cache_memory(
             limits which partitions are built, so a partition never demanded is never
             materialized; a demand with no such predicate builds every partition. Each
             build collects the (optionally partition-filtered) builder once, so a partition
-            is materialized at most once. Partition columns must be produced by the builder
-            but need not appear in ``schema``; those absent from ``schema`` are dropped from
-            the output and cannot be filtered on (Polars validates predicates against the
-            advertised schema). Across-partition row order is unspecified. Empty (default)
-            is identical to the single-buffer form.
+            is materialized at most once. Repeated demands are recognized by *structural*
+            predicate equality, so a logically-equivalent but differently-shaped predicate may
+            re-run a build that yields no new partitions (wasted work, never wrong results).
+            Partition columns must be produced by the builder but need not appear in
+            ``schema``; those absent from ``schema`` are dropped from the output and cannot be
+            filtered on (Polars validates predicates against the advertised schema). Across-
+            partition row order is unspecified. Empty (default) is identical to the
+            single-buffer form.
         description (str | None, default None): Optional free-form description of this source instance, attached to its OpenTelemetry span (``explain_detail``).
 
     Returns:
@@ -147,7 +150,7 @@ def cache_memory(
     if not isinstance(schema, pl.Schema) and not callable(schema):
         raise TypeError(f"cache_memory requires a pl.Schema or a callable, got {type(schema).__name__}")
 
-    partition_cols = (partition_cols,) if isinstance(partition_cols, str) else tuple(partition_cols)
+    partition_cols = (partition_cols,) if isinstance(partition_cols, str) else tuple(sorted(partition_cols))
 
     build_frame: Callable[[], pl.LazyFrame] = self_or_fn if callable(self_or_fn) else (lambda: self_or_fn)
 
@@ -297,7 +300,10 @@ def cache_memory(
                 built_predicates.append(restricted_pred)
             building = False
             build_cond.notify_all()
-        return list(buffers.values())
+            # Snapshot under the lock: a concurrent builder may be mutating ``buffers`` (setdefault
+            # above), so iterating it outside the lock could raise "dictionary changed size".
+            result = list(buffers.values())
+        return result
 
     def source_generator(
         with_columns: list[str] | None,

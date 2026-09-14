@@ -45,7 +45,7 @@ reading from the cache.
 ### `cache_memory`
 
 ```python
-lf.piot.cache_memory(*, schema)
+lf.piot.cache_memory(*, schema, partition_cols=())
 ```
 
 Collect the LazyFrame once into an in-memory buffer and replay it on every subsequent
@@ -59,7 +59,11 @@ The collected frame is reconciled against `schema` once (a missing declared colu
 mismatch raises; extra columns are dropped), and predicates and projections are applied to
 the buffer after materialization. The build runs at most once: a failure is recorded and
 re-raised on later collects, and the buffer is released when the returned frame is dropped.
-As a top-level function, `cache_memory(build_or_lf, *, schema)` additionally accepts a
+With `partition_cols`, the buffer is partitioned per partition value: a predicate on the
+partition columns restricts which partitions are built, so a partition never demanded is
+never materialized (a demand with no such predicate builds every partition). Partition
+columns must be produced by the builder but need not appear in `schema`. As a top-level
+function, `cache_memory(build_or_lf, *, schema, partition_cols=())` additionally accepts a
 zero-argument builder callable, executed on first row demand, in place of a LazyFrame.
 
 ### `debug`
