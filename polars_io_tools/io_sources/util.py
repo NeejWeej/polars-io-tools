@@ -30,6 +30,13 @@ __all__ = (
 )
 
 
+def optional_deps_error(feature: str) -> ModuleNotFoundError:
+    """Build the error raised when an optional feature's dependencies are not installed."""
+    return ModuleNotFoundError(
+        f"polars-io-tools {feature} requires optional dependencies that are not installed; install them with: pip install polars-io-tools[full]"
+    )
+
+
 def collect_lf_in_io_source(
     lf: pl.LazyFrame,
     batch_size: int | None,
@@ -125,7 +132,10 @@ def _storage_options_for(cache_uri: str, aws_profile: str | None = None) -> Stor
     if parsed.scheme not in {"s3", "s3a"}:
         return StorageOptions({}, {}, None)  # local filesystem
 
-    import boto3
+    try:
+        import boto3
+    except ImportError as exc:
+        raise optional_deps_error("S3 support") from exc
 
     session = boto3.Session(profile_name=aws_profile)
     creds = session.get_credentials()

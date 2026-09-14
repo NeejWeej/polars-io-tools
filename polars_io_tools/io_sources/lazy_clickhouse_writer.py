@@ -2,10 +2,15 @@ import io
 import logging
 
 import polars as pl
-import pyarrow as pa
-import requests
 
 from .._compat import POLARS_HAS_COLLECT_BATCHES
+from .util import optional_deps_error
+
+try:
+    import pyarrow as pa
+    import requests
+except ImportError as exc:
+    raise optional_deps_error("ClickHouse support") from exc
 
 __all__ = ("sink_clickhouse",)
 

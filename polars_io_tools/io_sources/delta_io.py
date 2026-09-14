@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import polars as pl
 
@@ -14,10 +14,19 @@ from .base import get_parsed_expr
 from .dnf_visitor import convert_expr_to_dnf
 from .enum import DataType
 from .translated_source import mapping_to_metadata, metadata_to_mapping, translate_polars_predicate
-from .util import _storage_options_for, collect_lf_in_io_source, extract_description_block, inject_description_block, register_io_source_with_is_pure
+from .util import (
+    _storage_options_for,
+    collect_lf_in_io_source,
+    extract_description_block,
+    inject_description_block,
+    optional_deps_error,
+    register_io_source_with_is_pure,
+)
 
-if TYPE_CHECKING:
+try:
     from deltalake import DeltaTable
+except ImportError as exc:
+    raise optional_deps_error("Delta support") from exc
 
 # Mapping block tag used in Delta table metadata description.
 # The mapping is stored as base64-encoded JSON between [tag:begin] and [tag:end] markers.
@@ -37,8 +46,6 @@ def _read_mapping_from_delta_configuration(
     storage_options: dict[str, Any] | None = None,
     version: int | str | datetime | None = None,
 ) -> dict[str, pl.DataType] | None:
-    from deltalake import DeltaTable  # type: ignore
-
     # Accept pre-constructed DeltaTable
     if isinstance(source, DeltaTable):
         dt = source
@@ -688,7 +695,6 @@ def scan_delta(
     # (DeltaTable contains RawDeltaTable which is not pickleable)
     mapping: dict[str, pl.DataType] | None
     exposed_schema: dict[str, pl.DataType]
-    from deltalake import DeltaTable  # type: ignore
 
     # DeltaTable only accepts int version; str/datetime handled via load_as_of
     int_version = version if isinstance(version, int) or version is None else None

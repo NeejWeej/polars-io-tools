@@ -1,11 +1,11 @@
 import datetime
+import json
 import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Generic, TypeVar
 
-import orjson
 import polars as pl
 from packaging import version
 
@@ -578,7 +578,7 @@ class ExprParser:
         try:
             # Get the serialized representation
             expr_json = expr.meta.serialize(format="json")
-            expr_dict = orjson.loads(expr_json)
+            expr_dict = json.loads(expr_json)
 
             # Check if expr_dict contains exactly one key
             if len(expr_dict) == 1:

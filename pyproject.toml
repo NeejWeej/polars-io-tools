@@ -31,27 +31,28 @@ classifiers = [
 ]
 
 dependencies = [
+    "packaging",
+    "polars>=1.8",
+    "portion",
+    "pydantic",
+]
+
+[project.optional-dependencies]
+full = [
     "arrow_odbc",
     "boto3",
     "cloudpickle",
     "deltalake",
     "narwhals",
     "numpy",
-    "orjson",
-    "packaging",
     "pandas",
-    "polars>=1.8",
-    "portion",
     "pyarrow",
     "pyodbc",
-    "pydantic",
     "ray",
     "requests",
     "sqlglot",
-    "tqdm"
+    "tqdm",
 ]
-
-[project.optional-dependencies]
 develop = [
     "build",
     "bump-my-version",
@@ -71,6 +72,20 @@ develop = [
     "ty",
     "uv",
     "wheel",
+    # Optional runtime deps (mirrors `full`, so the test suite can exercise every feature)
+    "arrow_odbc",
+    "boto3",
+    "cloudpickle",
+    "deltalake",
+    "narwhals",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pyodbc",
+    "ray",
+    "requests",
+    "sqlglot",
+    "tqdm",
     # tests
 ]
 
