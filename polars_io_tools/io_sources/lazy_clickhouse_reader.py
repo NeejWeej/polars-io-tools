@@ -27,6 +27,8 @@ def get_batch_reader_http(query: str, url: str, params: dict):
     query = f"{query} FORMAT ArrowStream"
     r = requests.post(url, params=(params | {"query": query}), stream=True)
     r.raise_for_status()
+    # Requests leaves raw responses encoded; decode HTTP compression as Arrow reads.
+    r.raw.decode_content = True
     return pa.ipc.open_stream(r.raw)
 
 
