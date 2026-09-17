@@ -145,6 +145,10 @@ lf = scan_clickhouse(
 result = lf.filter(pl.col("date") >= pl.date(2024, 1, 1)).collect()
 ```
 
+To enable HTTP response compression, add `"enable_http_compression": 1` to `params`.
+Compressed responses are decoded as the Arrow stream is read, including the initial
+schema request.
+
 ## Read Datadog metrics
 
 `scan_datadog` queries the Datadog metrics API. A filter on the `timestamp` column is
