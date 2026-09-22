@@ -307,6 +307,43 @@ def test_basic_query():
     assert_frame_equal(actual_from_query, expected)
 
 
+def test_dt_date_filter_pushdown():
+    """`.dt.date()` pushes down as a DATE cast and returns correct rows (issue #51).
+
+    The row check alone would pass even with the clause dropped (Polars re-filters
+    client-side), so the emitted SQL is captured to confirm the cast is pushed down.
+    """
+    import arrow_odbc
+
+    base_query = "SELECT CenterID, Centre, EventDate FROM CC_Bond"
+    df = get_cc_bond_df()
+    target = df["EventDate"].dt.date().min()
+
+    captured: list[str] = []
+    original_fake_func = arrow_odbc.read_arrow_batches_from_odbc
+
+    def capturing_fake_func(*args, **kwargs):
+        captured.append(args[0] if args else kwargs["query"])
+        return original_fake_func(*args, **kwargs)
+
+    arrow_odbc.read_arrow_batches_from_odbc = capturing_fake_func
+    try:
+        for equivalent_filters in (
+            [pl.col("EventDate").dt.date() == target],
+            [pl.col("EventDate").dt.date() >= target],
+        ):
+            expected = df.filter(*equivalent_filters).select(["CenterID", "Centre", "EventDate"])
+            actual = cpl.scan_db(base_query, "fake_connection_string").filter(*equivalent_filters).collect()
+            assert expected.height > 0
+            assert_frame_equal(actual, expected)
+    finally:
+        arrow_odbc.read_arrow_batches_from_odbc = original_fake_func
+
+    assert captured, "No SQL captured from read_arrow_batches_from_odbc"
+    data_queries = [sql for sql in captured if "WHERE" in sql]
+    assert data_queries and all('CAST("EventDate" AS DATE)' in sql for sql in data_queries), data_queries
+
+
 def test_implicit_cast_query():
     """Test implicit cast query"""
     base_query = """
@@ -886,6 +923,30 @@ def test_convert_predicate_to_sql_with_mssql_class():
     assert result_none is not None
     # All three should produce identical SQL
     assert result_str.sql() == result_cls.sql() == result_none.sql()
+
+
+@pytest.mark.parametrize(
+    "dialect, expected",
+    [
+        ("clickhouse", "CAST(ts AS Nullable(Date32)) = '2026-01-15'"),
+        ("tsql", "CAST(ts AS DATE) = '2026-01-15'"),
+        ("postgres", "CAST(ts AS DATE) = '2026-01-15'"),
+        ("duckdb", "CAST(ts AS DATE) = '2026-01-15'"),
+    ],
+)
+def test_dt_date_predicate_is_pushed_down(dialect, expected):
+    """``.dt.date()`` pushes down as a DATE cast instead of being silently dropped (issue #51).
+
+    ClickHouse targets ``Date32`` to match Polars' 1969/2200 boundary semantics.
+    """
+    from datetime import date
+
+    pred = (pl.col("ts").dt.date() == date(2026, 1, 15)) & pl.col("symbol").is_in(["A", "B"])
+    result = convert_predicate_to_sql(pred, dialect)
+    assert result is not None
+    sql = result.sql(dialect=dialect)
+    assert expected in sql
+    assert "symbol IN ('A', 'B')" in sql
 
 
 def test_oversized_in_predicate_is_not_pushed_down():

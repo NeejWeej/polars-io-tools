@@ -403,6 +403,38 @@ def test_head_pushdown_without_predicate():
         ch_mod.get_batch_reader_http = prev
 
 
+def test_dt_date_filter_pushdown():
+    """`.dt.date()` pushes down as a ``Date32`` cast rather than being dropped (issue #51)."""
+    ch_mod = polars_utils.lazy_clickhouse_reader
+
+    captured_queries: list[str] = []
+    prev = ch_mod.get_batch_reader_http
+
+    def capturing_fake(query, url, params):
+        captured_queries.append(query)
+        if "LIMIT 0" in query:
+            return fake_get_batch_reader_http(query, url, params)
+        # Data query uses ClickHouse-only Date32 syntax DuckDB can't parse; return an empty
+        # stream with the full schema so the generator completes and we can inspect the SQL.
+        return fake_get_batch_reader_http("SELECT * FROM CC_Bond LIMIT 0", url, params)
+
+    ch_mod.get_batch_reader_http = capturing_fake
+    try:
+        lf = cpl.scan_clickhouse("SELECT * FROM CC_Bond", FAKE_URL, FAKE_PARAMS)
+        captured_queries.clear()
+
+        lf.filter(pl.col("EventDate").dt.date() == date(2016, 1, 1)).collect()
+
+        data_queries = [q for q in captured_queries if "LIMIT 0" not in q]
+        assert len(data_queries) == 1
+        sql = data_queries[0]
+        assert "Date32" in sql, f"Expected a Date32 cast in pushed-down SQL, got: {sql}"
+        assert "EventDate" in sql
+        assert "2016-01-01" in sql
+    finally:
+        ch_mod.get_batch_reader_http = prev
+
+
 def test_head_zero_skips_query():
     """head(0) should return an empty DataFrame without sending a query to ClickHouse."""
     ch_mod = polars_utils.lazy_clickhouse_reader
