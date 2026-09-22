@@ -932,12 +932,17 @@ def test_convert_predicate_to_sql_with_mssql_class():
         ("tsql", "CAST(ts AS DATE) = '2026-01-15'"),
         ("postgres", "CAST(ts AS DATE) = '2026-01-15'"),
         ("duckdb", "CAST(ts AS DATE) = '2026-01-15'"),
+        # SQLite has no DATE type (a cast coerces to a numeric); Oracle DATE keeps the time
+        # component. Both need dedicated calendar-date functions, not a plain cast.
+        ("sqlite", "DATE(ts) = '2026-01-15'"),
+        ("oracle", "TRUNC(ts) = '2026-01-15'"),
     ],
 )
 def test_dt_date_predicate_is_pushed_down(dialect, expected):
-    """``.dt.date()`` pushes down as a DATE cast instead of being silently dropped (issue #51).
+    """``.dt.date()`` pushes down as a calendar-date expression instead of being dropped (issue #51).
 
-    ClickHouse targets ``Date32`` to match Polars' 1969/2200 boundary semantics.
+    The expression is dialect-specific: ``Date32`` for ClickHouse, ``DATE()`` for SQLite,
+    ``TRUNC`` for Oracle, and a ``DATE`` cast elsewhere.
     """
     from datetime import date
 
@@ -947,6 +952,37 @@ def test_dt_date_predicate_is_pushed_down(dialect, expected):
     sql = result.sql(dialect=dialect)
     assert expected in sql
     assert "symbol IN ('A', 'B')" in sql
+
+
+def test_dt_date_pushdown_sqlite_selects_non_midnight_row():
+    """SQLite pushdown floors to the calendar date, keeping non-midnight rows (PR #53 review).
+
+    ``CAST(... AS DATE)`` coerces to an integer in SQLite and would drop the row, so the
+    pushdown must use ``DATE()``.
+    """
+    import sqlite3
+    from datetime import date
+
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE t (ts TEXT)")
+    con.execute("INSERT INTO t VALUES ('2024-05-06 12:34:56'), ('2024-05-07 00:00:00')")
+
+    where = convert_predicate_to_sql(pl.col("ts").dt.date() == date(2024, 5, 6), "sqlite").sql(dialect="sqlite")
+    rows = con.execute(f"SELECT ts FROM t WHERE {where}").fetchall()
+    assert rows == [("2024-05-06 12:34:56",)]
+
+
+def test_dt_date_pushdown_oracle_uses_trunc():
+    """Oracle pushdown uses TRUNC, not CAST(... AS DATE) (PR #53 review).
+
+    Oracle ``DATE`` retains the time component, so casting a non-midnight timestamp and
+    comparing it to a midnight date literal would drop the row; ``TRUNC`` floors to the day.
+    """
+    from datetime import date
+
+    sql = convert_predicate_to_sql(pl.col("ts").dt.date() == date(2024, 5, 6), "oracle").sql(dialect="oracle")
+    assert "TRUNC(ts) = '2024-05-06'" in sql
+    assert "CAST(ts AS DATE)" not in sql
 
 
 def test_oversized_in_predicate_is_not_pushed_down():

@@ -423,9 +423,24 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
                 )
                 self.result = None
             return
-        # ClickHouse ``Date`` spans only 1970-2149; cast to the wider ``Date32`` so date
-        # predicates outside that range (where ``Date`` diverges from Polars) still match.
-        date_type = sqlglot.exp.DataType.Type.DATE32 if self.dialect == Dialects.CLICKHOUSE else sqlglot.exp.DataType.Type.DATE
+
+        def _date_floor(x: sqlglot.exp.Expression) -> sqlglot.exp.Expression:
+            """Floor a timestamp to its calendar date, matching Polars ``.dt.date()``."""
+            if self.dialect == Dialects.CLICKHOUSE:
+                # ClickHouse ``Date`` spans only 1970-2149; ``Date32`` (1900-2299) covers the
+                # boundaries where ``Date`` diverges from Polars.
+                return sqlglot.exp.Cast(this=x, to=sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.DATE32))
+            if self.dialect == Dialects.ORACLE:
+                # Oracle ``DATE`` retains the time component, so a plain cast keeps the clock
+                # time and a noon timestamp would not match a midnight date literal; ``TRUNC``
+                # floors to the calendar day.
+                return sqlglot.exp.func("TRUNC", x)
+            if self.dialect == Dialects.SQLITE:
+                # SQLite has no date type; ``CAST(... AS DATE)`` coerces to a numeric (e.g. 2024),
+                # so use the ``DATE()`` function to extract the calendar date.
+                return sqlglot.exp.Date(this=x)
+            return sqlglot.exp.Cast(this=x, to=sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.DATE))
+
         func_map = {
             TemporalFunctionType.YEAR: lambda x: sqlglot.exp.Extract(this="YEAR", expression=x),
             TemporalFunctionType.MONTH: lambda x: sqlglot.exp.Extract(this="MONTH", expression=x),
@@ -433,7 +448,7 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
             TemporalFunctionType.HOUR: lambda x: sqlglot.exp.Extract(this="HOUR", expression=x),
             TemporalFunctionType.MINUTE: lambda x: sqlglot.exp.Extract(this="MINUTE", expression=x),
             TemporalFunctionType.SECOND: lambda x: sqlglot.exp.Extract(this="SECOND", expression=x),
-            TemporalFunctionType.DATE: lambda x: sqlglot.exp.Cast(this=x, to=sqlglot.exp.DataType(this=date_type)),
+            TemporalFunctionType.DATE: _date_floor,
         }
 
         if node.function_type in func_map and input_exprs:
