@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any, cast
 
 import polars as pl
@@ -89,13 +89,19 @@ def polars_dtype_to_sqlglot_type(dtype: pl.DataType | type[pl.DataType], *, stri
     return sqlglot.exp.DataType(this=base)
 
 
-def create_sqlglot_literal(value: Any, dialect: str | Dialects | None = None) -> sqlglot.exp.Expression:
+def create_sqlglot_literal(value: Any, dialect: str | Dialects | type[Dialect] | None = None) -> sqlglot.exp.Expression:
     """Create a sqlglot literal from a raw value.
 
     - None -> NULL
     - bool -> SQL boolean (TRUE / FALSE)
     - Numeric -> unquoted literal
-    - Other types (str, date, datetime, time, etc.) -> quoted string literal
+    - Timezone-aware datetime -> the equivalent UTC instant. ClickHouse renders it as an
+      explicit ``toDateTime64(..., 'UTC')`` because it rejects an offset-bearing string
+      against a ``DateTime64`` column; other dialects keep the offset string unchanged.
+    - Other types (str, date, naive datetime, time, etc.) -> quoted string literal
+
+    ``dialect`` selects backend-specific rendering; it currently only affects
+    timezone-aware datetimes.
     """
     if value is None:
         return sqlglot.exp.Null()
@@ -105,6 +111,20 @@ def create_sqlglot_literal(value: Any, dialect: str | Dialects | None = None) ->
 
     if isinstance(value, date) and not isinstance(value, datetime) and dialect == Dialects.ORACLE:
         return sqlglot.exp.DateStrToDate(this=sqlglot.exp.Literal.string(str(value)))
+
+    if isinstance(value, datetime) and value.utcoffset() is not None and dialect == Dialects.CLICKHOUSE:
+        # A tz-aware datetime stringifies with a UTC offset (e.g. "...+00:00") that ClickHouse
+        # rejects against a DateTime64 column. Emit an explicit-UTC instant so the comparison is
+        # correct regardless of the column's own timezone (a bare naive string would be parsed in
+        # the column's tz and could shift the bounds). Bounds outside DateTime64's representable
+        # range (~1677-2262 at nanosecond precision) still error server-side, as they did before.
+        utc_naive = value.astimezone(UTC).replace(tzinfo=None)
+        return sqlglot.exp.func(
+            "toDateTime64",
+            sqlglot.exp.Literal.string(str(utc_naive)),
+            sqlglot.exp.Literal.number(6),
+            sqlglot.exp.Literal.string("UTC"),
+        )
 
     is_plain_numeric = isinstance(value, (int, float))
     return sqlglot.exp.Literal(

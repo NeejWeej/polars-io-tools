@@ -3,7 +3,7 @@ import io
 import logging
 import sys
 import threading
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import duckdb
@@ -730,6 +730,43 @@ def test_create_sqlglot_literal_bool_via_duckdb(duckdb_connection):
 
     assert sorted(r[0] for r in rows_true) == [1, 3]
     assert [r[0] for r in rows_false] == [2]
+
+
+def test_tz_aware_datetime_clickhouse_uses_explicit_utc():
+    """ClickHouse renders tz-aware datetimes as an explicit-UTC instant (issue #52).
+
+    An offset-bearing string is rejected by DateTime64, and a bare naive string would be
+    interpreted in the column's timezone; toDateTime64(..., 'UTC') is unambiguous.
+    """
+    est = timezone(timedelta(hours=-5))
+    pred = (pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)) & (pl.col("ts") < datetime(2026, 1, 15, 9, 0, 0, 123456, tzinfo=est))
+    sql = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
+    assert "+00:00" not in sql
+    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in sql
+    # non-UTC bound normalized to the equivalent UTC instant, microseconds preserved
+    assert "toDateTime64('2026-01-15 14:00:00.123456', 6, 'UTC')" in sql
+
+
+def test_tz_aware_datetime_is_in_clickhouse_uses_explicit_utc():
+    """is_in with tz-aware datetimes routes through the same ClickHouse rendering (issue #52)."""
+    pred = pl.col("ts").is_in([datetime(2026, 1, 15, tzinfo=UTC), datetime(2026, 1, 16, tzinfo=UTC)])
+    sql = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
+    assert "+00:00" not in sql
+    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in sql
+    assert "toDateTime64('2026-01-16 00:00:00', 6, 'UTC')" in sql
+
+
+@pytest.mark.parametrize("dialect", ["tsql", "postgres", "duckdb"])
+def test_tz_aware_datetime_non_clickhouse_unchanged(dialect):
+    """Non-ClickHouse dialects keep the existing offset-string rendering (#52 is ClickHouse-scoped)."""
+    pred = pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)
+    sql = convert_predicate_to_sql(pred, dialect).sql(dialect=dialect)
+    assert "2026-01-15 00:00:00+00:00" in sql
+
+
+def test_naive_datetime_literal_unchanged():
+    """Naive datetimes are unaffected by the tz-aware handling."""
+    assert create_sqlglot_literal(datetime(2026, 1, 15, 12, 30)).sql() == "'2026-01-15 12:30:00'"
 
 
 def test_visit_function_is_null():
