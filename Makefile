@@ -34,6 +34,26 @@ build: build-rs build-py  ## build the project
 install:  ## install python library
 	uv pip install .
 
+##########
+# DOCKER #
+##########
+.PHONY: dockerup dockerps dockerdown
+# Which ci/<ADAPTER>/docker-compose.yml to use for service-backed integration tests.
+ADAPTER := clickhouse
+# Prefer docker, fall back to podman-compose; override with DOCKER_COMPOSE=...
+DOCKER_COMPOSE := $(shell command -v docker >/dev/null 2>&1 && echo "docker compose" || echo "podman-compose")
+# Extra args for `up`, e.g. DOCKERARGS="--wait --wait-timeout 180" to block until healthy.
+DOCKERARGS :=
+
+dockerup:  ## spin up docker compose services for integration testing (ADAPTER=clickhouse)
+	$(DOCKER_COMPOSE) -f ci/$(ADAPTER)/docker-compose.yml up -d $(DOCKERARGS)
+
+dockerps:  ## show status of the integration testing services
+	$(DOCKER_COMPOSE) -f ci/$(ADAPTER)/docker-compose.yml ps
+
+dockerdown:  ## spin down docker compose services for integration testing
+	$(DOCKER_COMPOSE) -f ci/$(ADAPTER)/docker-compose.yml down
+
 #########
 # LINTS #
 #########

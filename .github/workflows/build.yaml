@@ -166,3 +166,48 @@ jobs:
         with:
           name: dist-${{ matrix.name }}
           path: ${{ matrix.dist_path }}
+
+  test_clickhouse:
+    name: test (clickhouse integration)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions-ext/python/setup@ec67f82b3bd863948308a41ecb9e70547cbb19c7
+        with:
+          version: "3.11"
+
+      # Reuse the Linux wheel built by the `build` job instead of rebuilding the Rust extension.
+      - name: Download wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: dist-ubuntu-latest
+          path: dist
+
+      - name: Install wheel
+        run: |
+          python -m pip install -U "$(ls dist/*manylinux*.whl)[develop]"
+          # Overlay the wheel (including the compiled extension) into the source tree so the
+          # checked-out package is importable even though its Rust extension was never built here.
+          python -m pip install -U --no-deps "$(ls dist/*manylinux*.whl)" --target .
+
+      # ClickHouse declares a healthcheck, so --wait blocks until the HTTP interface is ready.
+      - name: Spin up ClickHouse
+        run: make dockerup DOCKERARGS="--wait --wait-timeout 180"
+
+      - name: Run ClickHouse integration tests
+        run: python -m pytest polars_io_tools/tests/integration -m clickhouse_required
+        env:
+          CLICKHOUSE_URL: http://127.0.0.1:8123
+          CLICKHOUSE_USER: default
+
+      - name: Spin down ClickHouse
+        run: make dockerdown
+        if: ${{ always() }}
