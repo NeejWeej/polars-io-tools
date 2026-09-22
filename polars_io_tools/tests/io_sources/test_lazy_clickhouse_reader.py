@@ -121,7 +121,7 @@ def duckdb_connection():
 # reader.close() code path in scan_clickhouse.
 
 
-def fake_get_batch_reader_http(query: str, url: str, params: dict):
+def fake_get_batch_reader_http(query: str, url: str, params: dict, **kwargs):
     global _duckdb_conn
     table = _duckdb_conn.execute(query).fetch_arrow_table()
     sink = pa.BufferOutputStream()
@@ -164,7 +164,7 @@ def test_scan_clickhouse_decodes_http_response(monkeypatch, content_encoding, em
     queries = []
     responses = []
 
-    def fake_post(url, *, params, stream):
+    def fake_post(url, *, params, stream, timeout=None):
         assert stream is True
         query = params["query"]
         queries.append(query)
@@ -378,7 +378,7 @@ def test_head_pushdown_without_predicate():
 
     original_fake = fake_get_batch_reader_http
 
-    def capturing_fake(query, url, params):
+    def capturing_fake(query, url, params, **kwargs):
         captured_queries.append(query)
         return original_fake(query, url, params)
 
@@ -410,7 +410,7 @@ def test_head_zero_skips_query():
     captured_queries: list[str] = []
     prev = ch_mod.get_batch_reader_http
 
-    def capturing_fake(query, url, params):
+    def capturing_fake(query, url, params, **kwargs):
         captured_queries.append(query)
         return fake_get_batch_reader_http(query, url, params)
 
@@ -437,7 +437,7 @@ def test_head_zero_with_column_selection():
     captured_queries: list[str] = []
     prev = ch_mod.get_batch_reader_http
 
-    def capturing_fake(query, url, params):
+    def capturing_fake(query, url, params, **kwargs):
         captured_queries.append(query)
         return fake_get_batch_reader_http(query, url, params)
 
