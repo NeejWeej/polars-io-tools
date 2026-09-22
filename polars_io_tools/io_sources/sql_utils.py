@@ -1,5 +1,6 @@
 import logging
 import re
+from datetime import date, datetime
 from typing import Any, cast
 
 import polars as pl
@@ -88,7 +89,7 @@ def polars_dtype_to_sqlglot_type(dtype: pl.DataType | type[pl.DataType], *, stri
     return sqlglot.exp.DataType(this=base)
 
 
-def create_sqlglot_literal(value: Any) -> sqlglot.exp.Expression:
+def create_sqlglot_literal(value: Any, dialect: str | Dialects | None = None) -> sqlglot.exp.Expression:
     """Create a sqlglot literal from a raw value.
 
     - None -> NULL
@@ -101,6 +102,9 @@ def create_sqlglot_literal(value: Any) -> sqlglot.exp.Expression:
 
     if isinstance(value, bool):
         return sqlglot.exp.Boolean(this=value)
+
+    if isinstance(value, date) and not isinstance(value, datetime) and dialect == Dialects.ORACLE:
+        return sqlglot.exp.DateStrToDate(this=sqlglot.exp.Literal.string(str(value)))
 
     is_plain_numeric = isinstance(value, (int, float))
     return sqlglot.exp.Literal(
@@ -190,7 +194,7 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
         value = node.value
 
         # Handle different literal types via central helper
-        self.result = create_sqlglot_literal(value)
+        self.result = create_sqlglot_literal(value, self.dialect)
 
     def visit_binary_expr(self, node: BinaryExprNode) -> None:
         """Convert binary expression to SQL expression."""
@@ -301,7 +305,7 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
                     )
                     self.result = None
                     return
-                values = [create_sqlglot_literal(v) for v in in_values]
+                values = [create_sqlglot_literal(v, self.dialect) for v in in_values]
                 self.result = sqlglot.exp.In(this=input_exprs[0], expressions=values)
             else:
                 self.result = sqlglot.exp.In(this=input_exprs[0], expressions=[input_exprs[1]])

@@ -935,7 +935,7 @@ def test_convert_predicate_to_sql_with_mssql_class():
         # SQLite has no DATE type (a cast coerces to a numeric); Oracle DATE keeps the time
         # component. Both need dedicated calendar-date functions, not a plain cast.
         ("sqlite", "DATE(ts) = '2026-01-15'"),
-        ("oracle", "TRUNC(ts) = '2026-01-15'"),
+        ("oracle", "TRUNC(ts) = TO_DATE('2026-01-15', 'YYYY-MM-DD')"),
     ],
 )
 def test_dt_date_predicate_is_pushed_down(dialect, expected):
@@ -981,8 +981,16 @@ def test_dt_date_pushdown_oracle_uses_trunc():
     from datetime import date
 
     sql = convert_predicate_to_sql(pl.col("ts").dt.date() == date(2024, 5, 6), "oracle").sql(dialect="oracle")
-    assert "TRUNC(ts) = '2024-05-06'" in sql
+    assert "TRUNC(ts) = TO_DATE('2024-05-06', 'YYYY-MM-DD')" in sql
     assert "CAST(ts AS DATE)" not in sql
+
+
+def test_date_is_in_pushdown_oracle_uses_typed_literals():
+    """Oracle date lists use explicit conversions instead of NLS-dependent strings."""
+    from datetime import date
+
+    sql = convert_predicate_to_sql(pl.col("day").is_in([date(2024, 5, 6), date(2024, 5, 7)]), "oracle").sql(dialect="oracle")
+    assert "day IN (TO_DATE('2024-05-06', 'YYYY-MM-DD'), TO_DATE('2024-05-07', 'YYYY-MM-DD'))" in sql
 
 
 def test_oversized_in_predicate_is_not_pushed_down():
