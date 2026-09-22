@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pyarrow.fs as pa_fs
@@ -57,17 +58,22 @@ def databricks_token(pytestconfig):
 
 @pytest.fixture(scope="session")
 def clickhouse_url(pytestconfig):
-    return pytestconfig.getoption("--clickhouse-url") or None
+    return pytestconfig.getoption("--clickhouse-url") or os.environ.get("CLICKHOUSE_URL") or None
 
 
 @pytest.fixture(scope="session")
 def clickhouse_user(pytestconfig):
-    return pytestconfig.getoption("--clickhouse-user") or None
+    return pytestconfig.getoption("--clickhouse-user") or os.environ.get("CLICKHOUSE_USER") or None
 
 
 @pytest.fixture(scope="session")
 def clickhouse_password(pytestconfig):
-    return pytestconfig.getoption("--clickhouse-password") or None
+    option = pytestconfig.getoption("--clickhouse-password")
+    if option is not None:
+        return option
+    # An empty CLICKHOUSE_PASSWORD is meaningful (the default ClickHouse user has
+    # no password), so distinguish "unset" from "set to empty".
+    return os.environ.get("CLICKHOUSE_PASSWORD")
 
 
 @pytest.fixture
@@ -144,12 +150,15 @@ def pytest_collection_modifyitems(config, items):
             if "databricks_auth_required" in item.keywords:
                 item.add_marker(skip_marker)
 
-    # Skip tests marked as clickhouse_required if url, user, or password not provided
-    clickhouse_url = config.getoption("--clickhouse-url")
-    clickhouse_user = config.getoption("--clickhouse-user")
-    clickhouse_password = config.getoption("--clickhouse-password")
-    if not (clickhouse_url and clickhouse_user and clickhouse_password):
-        skip_marker = pytest.mark.skip(reason="requires --clickhouse-url, --clickhouse-user, and --clickhouse-password for this test")
+    # Skip tests marked as clickhouse_required unless url and user are available
+    # (via CLI options or the CLICKHOUSE_* env vars). The password may be empty
+    # (the default ClickHouse user has none), so it is not part of this gate.
+    clickhouse_url = config.getoption("--clickhouse-url") or os.environ.get("CLICKHOUSE_URL")
+    clickhouse_user = config.getoption("--clickhouse-user") or os.environ.get("CLICKHOUSE_USER")
+    if not (clickhouse_url and clickhouse_user):
+        skip_marker = pytest.mark.skip(
+            reason="requires --clickhouse-url and --clickhouse-user (or CLICKHOUSE_URL/CLICKHOUSE_USER env vars) for this test"
+        )
         for item in items:
             if "clickhouse_required" in item.keywords:
                 item.add_marker(skip_marker)
