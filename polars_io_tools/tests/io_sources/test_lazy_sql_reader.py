@@ -747,6 +747,22 @@ def test_tz_aware_datetime_clickhouse_uses_explicit_utc():
     assert "toDateTime64('2026-01-15 14:00:00.123456', 6, 'UTC')" in sql
 
 
+def test_tz_aware_datetime_clickhouse_dialect_class():
+    """The ClickHouse dialect class normalizes like the 'clickhouse' string (issue #52).
+
+    Passing SQLGlot's ``ClickHouse`` class must not fall back to TSQL, which would emit the
+    offset-bearing string this fix removes.
+    """
+    from sqlglot.dialects import ClickHouse
+
+    pred = pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)
+    from_str = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
+    from_cls = convert_predicate_to_sql(pred, ClickHouse).sql(dialect="clickhouse")
+    assert from_str == from_cls
+    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in from_cls
+    assert "+00:00" not in from_cls
+
+
 def test_tz_aware_datetime_is_in_clickhouse_uses_explicit_utc():
     """is_in with tz-aware datetimes routes through the same ClickHouse rendering (issue #52)."""
     pred = pl.col("ts").is_in([datetime(2026, 1, 15, tzinfo=UTC), datetime(2026, 1, 16, tzinfo=UTC)])

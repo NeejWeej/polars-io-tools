@@ -196,6 +196,13 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
                 self.dialect = Dialects(dialect)
             except ValueError:
                 self.dialect = Dialects.DIALECT  # unknown → generic
+        elif isinstance(dialect, type) and issubclass(dialect, Dialect):
+            # Map a SQLGlot dialect class (e.g. ClickHouse) to its Dialects enum by name, so
+            # dialect-specific handling is not lost; an unknown class falls back to generic.
+            try:
+                self.dialect = Dialects(dialect.__name__.lower())
+            except ValueError:
+                self.dialect = Dialects.DIALECT
         else:
             self.dialect = Dialects.TSQL
         self.result: sqlglot.exp.Expression | None = None
