@@ -1,5 +1,6 @@
 import logging
 import re
+from datetime import date, datetime
 from typing import Any, cast
 
 import polars as pl
@@ -88,7 +89,7 @@ def polars_dtype_to_sqlglot_type(dtype: pl.DataType | type[pl.DataType], *, stri
     return sqlglot.exp.DataType(this=base)
 
 
-def create_sqlglot_literal(value: Any) -> sqlglot.exp.Expression:
+def create_sqlglot_literal(value: Any, dialect: str | Dialects | None = None) -> sqlglot.exp.Expression:
     """Create a sqlglot literal from a raw value.
 
     - None -> NULL
@@ -101,6 +102,9 @@ def create_sqlglot_literal(value: Any) -> sqlglot.exp.Expression:
 
     if isinstance(value, bool):
         return sqlglot.exp.Boolean(this=value)
+
+    if isinstance(value, date) and not isinstance(value, datetime) and dialect == Dialects.ORACLE:
+        return sqlglot.exp.DateStrToDate(this=sqlglot.exp.Literal.string(str(value)))
 
     is_plain_numeric = isinstance(value, (int, float))
     return sqlglot.exp.Literal(
@@ -190,7 +194,7 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
         value = node.value
 
         # Handle different literal types via central helper
-        self.result = create_sqlglot_literal(value)
+        self.result = create_sqlglot_literal(value, self.dialect)
 
     def visit_binary_expr(self, node: BinaryExprNode) -> None:
         """Convert binary expression to SQL expression."""
@@ -301,7 +305,7 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
                     )
                     self.result = None
                     return
-                values = [create_sqlglot_literal(v) for v in in_values]
+                values = [create_sqlglot_literal(v, self.dialect) for v in in_values]
                 self.result = sqlglot.exp.In(this=input_exprs[0], expressions=values)
             else:
                 self.result = sqlglot.exp.In(this=input_exprs[0], expressions=[input_exprs[1]])
@@ -423,24 +427,33 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
                 )
                 self.result = None
             return
-        if self.dialect == Dialects.TSQL:  # SQL Server
-            func_map = {
-                TemporalFunctionType.YEAR: lambda x: sqlglot.exp.Extract(this="YEAR", expression=x),
-                TemporalFunctionType.MONTH: lambda x: sqlglot.exp.Extract(this="MONTH", expression=x),
-                TemporalFunctionType.DAY: lambda x: sqlglot.exp.Extract(this="DAY", expression=x),
-                TemporalFunctionType.HOUR: lambda x: sqlglot.exp.Extract(this="HOUR", expression=x),
-                TemporalFunctionType.MINUTE: lambda x: sqlglot.exp.Extract(this="MINUTE", expression=x),
-                TemporalFunctionType.SECOND: lambda x: sqlglot.exp.Extract(this="SECOND", expression=x),
-            }
-        else:  # Generic SQL
-            func_map = {
-                TemporalFunctionType.YEAR: lambda x: sqlglot.exp.Extract(this="YEAR", expression=x),
-                TemporalFunctionType.MONTH: lambda x: sqlglot.exp.Extract(this="MONTH", expression=x),
-                TemporalFunctionType.DAY: lambda x: sqlglot.exp.Extract(this="DAY", expression=x),
-                TemporalFunctionType.HOUR: lambda x: sqlglot.exp.Extract(this="HOUR", expression=x),
-                TemporalFunctionType.MINUTE: lambda x: sqlglot.exp.Extract(this="MINUTE", expression=x),
-                TemporalFunctionType.SECOND: lambda x: sqlglot.exp.Extract(this="SECOND", expression=x),
-            }
+
+        def _date_floor(x: sqlglot.exp.Expression) -> sqlglot.exp.Expression:
+            """Floor a timestamp to its calendar date, matching Polars ``.dt.date()``."""
+            if self.dialect == Dialects.CLICKHOUSE:
+                # ClickHouse ``Date`` spans only 1970-2149; ``Date32`` (1900-2299) covers the
+                # boundaries where ``Date`` diverges from Polars.
+                return sqlglot.exp.Cast(this=x, to=sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.DATE32))
+            if self.dialect == Dialects.ORACLE:
+                # Oracle ``DATE`` retains the time component, so a plain cast keeps the clock
+                # time and a noon timestamp would not match a midnight date literal; ``TRUNC``
+                # floors to the calendar day.
+                return sqlglot.exp.func("TRUNC", x)
+            if self.dialect == Dialects.SQLITE:
+                # SQLite has no date type; ``CAST(... AS DATE)`` coerces to a numeric (e.g. 2024),
+                # so use the ``DATE()`` function to extract the calendar date.
+                return sqlglot.exp.Date(this=x)
+            return sqlglot.exp.Cast(this=x, to=sqlglot.exp.DataType(this=sqlglot.exp.DataType.Type.DATE))
+
+        func_map = {
+            TemporalFunctionType.YEAR: lambda x: sqlglot.exp.Extract(this="YEAR", expression=x),
+            TemporalFunctionType.MONTH: lambda x: sqlglot.exp.Extract(this="MONTH", expression=x),
+            TemporalFunctionType.DAY: lambda x: sqlglot.exp.Extract(this="DAY", expression=x),
+            TemporalFunctionType.HOUR: lambda x: sqlglot.exp.Extract(this="HOUR", expression=x),
+            TemporalFunctionType.MINUTE: lambda x: sqlglot.exp.Extract(this="MINUTE", expression=x),
+            TemporalFunctionType.SECOND: lambda x: sqlglot.exp.Extract(this="SECOND", expression=x),
+            TemporalFunctionType.DATE: _date_floor,
+        }
 
         if node.function_type in func_map and input_exprs:
             self.result = func_map[node.function_type](input_exprs[0])
