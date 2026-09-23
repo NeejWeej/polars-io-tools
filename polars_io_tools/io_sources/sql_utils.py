@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 import polars as pl
@@ -89,13 +89,57 @@ def polars_dtype_to_sqlglot_type(dtype: pl.DataType | type[pl.DataType], *, stri
     return sqlglot.exp.DataType(this=base)
 
 
-def create_sqlglot_literal(value: Any, dialect: str | Dialects | None = None) -> sqlglot.exp.Expression:
+def _to_datetime64(text: str, precision: int, *, tz_aware: bool) -> sqlglot.exp.Expression:
+    """Build a ClickHouse ``toDateTime64(text, precision[, 'UTC'])`` instant literal."""
+    args: list[sqlglot.exp.Expression] = [sqlglot.exp.Literal.string(text), sqlglot.exp.Literal.number(precision)]
+    if tz_aware:
+        args.append(sqlglot.exp.Literal.string("UTC"))
+    return sqlglot.exp.func("toDateTime64", *args)
+
+
+def _clickhouse_datetime_literal(expr: pl.Expr) -> sqlglot.exp.Expression | None:
+    """Render a datetime literal as a full-precision ClickHouse ``toDateTime64`` instant.
+
+    ``LiteralNode.value`` is a microsecond-max Python ``datetime``, so a ``Datetime('ns')``
+    literal -- and the bounds of the nanosecond ``is_between`` Polars builds for a nanosecond
+    column -- would truncate and drop matching rows. The physical value keeps full precision;
+    render the UTC instant (tz-aware) or wall-clock instant (naive) at the literal's own
+    resolution. Returns ``None`` for anything that is not a single, representable Datetime value,
+    so the caller skips pushdown and leaves the exact client-side filter in place.
+    """
+    try:
+        series = pl.DataFrame().select(expr).to_series()
+    except Exception:  # noqa: BLE001 -- defensive: skip pushdown if the literal can't be evaluated
+        return None
+    dtype = series.dtype
+    if not isinstance(dtype, pl.Datetime) or len(series) != 1:
+        return None
+    ticks = series.to_physical().to_list()[0]
+    if ticks is None:
+        return None
+    ticks_per_second, precision = {"ms": (1_000, 3), "us": (1_000_000, 6), "ns": (1_000_000_000, 9)}[dtype.time_unit]
+    seconds, fraction = divmod(ticks, ticks_per_second)
+    try:
+        instant = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=seconds)
+    except (OverflowError, OSError):
+        return None
+    text = instant.strftime("%Y-%m-%d %H:%M:%S") + (f".{fraction:0{precision}d}" if fraction else "")
+    return _to_datetime64(text, precision, tz_aware=dtype.time_zone is not None)
+
+
+def create_sqlglot_literal(value: Any, dialect: str | Dialects | type[Dialect] | None = None) -> sqlglot.exp.Expression:
     """Create a sqlglot literal from a raw value.
 
     - None -> NULL
     - bool -> SQL boolean (TRUE / FALSE)
     - Numeric -> unquoted literal
-    - Other types (str, date, datetime, time, etc.) -> quoted string literal
+    - Timezone-aware datetime -> the equivalent UTC instant. ClickHouse renders it as an
+      explicit ``toDateTime64(..., 'UTC')`` because it rejects an offset-bearing string
+      against a ``DateTime64`` column; other dialects keep the offset string unchanged.
+    - Other types (str, date, naive datetime, time, etc.) -> quoted string literal
+
+    ``dialect`` selects backend-specific rendering; it currently only affects
+    timezone-aware datetimes.
     """
     if value is None:
         return sqlglot.exp.Null()
@@ -105,6 +149,15 @@ def create_sqlglot_literal(value: Any, dialect: str | Dialects | None = None) ->
 
     if isinstance(value, date) and not isinstance(value, datetime) and dialect == Dialects.ORACLE:
         return sqlglot.exp.DateStrToDate(this=sqlglot.exp.Literal.string(str(value)))
+
+    if isinstance(value, datetime) and value.utcoffset() is not None and dialect == Dialects.CLICKHOUSE:
+        # A tz-aware datetime stringifies with a UTC offset (e.g. "...+00:00") that ClickHouse
+        # rejects against a DateTime64 column. Emit an explicit-UTC instant so the comparison is
+        # correct regardless of the column's own timezone (a bare naive string would be parsed in
+        # the column's tz and could shift the bounds). This microsecond path serves ``is_in``
+        # values; scalar comparisons preserve full precision via ``visit_literal``.
+        utc_naive = value.astimezone(UTC).replace(tzinfo=None)
+        return _to_datetime64(str(utc_naive), 6, tz_aware=True)
 
     is_plain_numeric = isinstance(value, (int, float))
     return sqlglot.exp.Literal(
@@ -176,6 +229,13 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
                 self.dialect = Dialects(dialect)
             except ValueError:
                 self.dialect = Dialects.DIALECT  # unknown → generic
+        elif isinstance(dialect, type) and issubclass(dialect, Dialect):
+            # Map a SQLGlot dialect class (e.g. ClickHouse) to its Dialects enum by name, so
+            # dialect-specific handling is not lost; an unknown class falls back to generic.
+            try:
+                self.dialect = Dialects(dialect.__name__.lower())
+            except ValueError:
+                self.dialect = Dialects.DIALECT
         else:
             self.dialect = Dialects.TSQL
         self.result: sqlglot.exp.Expression | None = None
@@ -192,6 +252,13 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
         """Convert literal value to SQL literal."""
 
         value = node.value
+
+        # ClickHouse DateTime64 keeps up to nanoseconds, but ``node.value`` is microsecond-max;
+        # render the literal from its source expression so nanosecond-column filters stay exact.
+        # ``None`` (unrepresentable) skips pushdown, leaving the exact client-side filter.
+        if self.dialect == Dialects.CLICKHOUSE and isinstance(value, datetime):
+            self.result = _clickhouse_datetime_literal(node.expr)
+            return
 
         # Handle different literal types via central helper
         self.result = create_sqlglot_literal(value, self.dialect)

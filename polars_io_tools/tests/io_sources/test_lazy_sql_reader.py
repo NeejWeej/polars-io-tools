@@ -3,7 +3,7 @@ import io
 import logging
 import sys
 import threading
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import duckdb
@@ -730,6 +730,115 @@ def test_create_sqlglot_literal_bool_via_duckdb(duckdb_connection):
 
     assert sorted(r[0] for r in rows_true) == [1, 3]
     assert [r[0] for r in rows_false] == [2]
+
+
+def test_tz_aware_datetime_clickhouse_uses_explicit_utc():
+    """ClickHouse renders tz-aware datetimes as an explicit-UTC instant (issue #52).
+
+    An offset-bearing string is rejected by DateTime64, and a bare naive string would be
+    interpreted in the column's timezone; toDateTime64(..., 'UTC') is unambiguous.
+    """
+    est = timezone(timedelta(hours=-5))
+    pred = (pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)) & (pl.col("ts") < datetime(2026, 1, 15, 9, 0, 0, 123456, tzinfo=est))
+    sql = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
+    assert "+00:00" not in sql
+    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in sql
+    # non-UTC bound normalized to the equivalent UTC instant, microseconds preserved
+    assert "toDateTime64('2026-01-15 14:00:00.123456', 6, 'UTC')" in sql
+
+
+def test_tz_aware_datetime_clickhouse_dialect_class():
+    """The ClickHouse dialect class normalizes like the 'clickhouse' string (issue #52).
+
+    Passing SQLGlot's ``ClickHouse`` class must not fall back to TSQL, which would emit the
+    offset-bearing string this fix removes.
+    """
+    from sqlglot.dialects import ClickHouse
+
+    pred = pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)
+    from_str = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
+    from_cls = convert_predicate_to_sql(pred, ClickHouse).sql(dialect="clickhouse")
+    assert from_str == from_cls
+    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in from_cls
+    assert "+00:00" not in from_cls
+
+
+def test_tz_aware_datetime_is_in_clickhouse_uses_explicit_utc():
+    """is_in with tz-aware datetimes routes through the same ClickHouse rendering (issue #52)."""
+    pred = pl.col("ts").is_in([datetime(2026, 1, 15, tzinfo=UTC), datetime(2026, 1, 16, tzinfo=UTC)])
+    sql = convert_predicate_to_sql(pred, "clickhouse").sql(dialect="clickhouse")
+    assert "+00:00" not in sql
+    assert "toDateTime64('2026-01-15 00:00:00', 6, 'UTC')" in sql
+    assert "toDateTime64('2026-01-16 00:00:00', 6, 'UTC')" in sql
+
+
+@pytest.mark.parametrize("dialect", ["tsql", "postgres", "duckdb"])
+def test_tz_aware_datetime_non_clickhouse_unchanged(dialect):
+    """Non-ClickHouse dialects keep the existing offset-string rendering (#52 is ClickHouse-scoped)."""
+    pred = pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC)
+    sql = convert_predicate_to_sql(pred, dialect).sql(dialect=dialect)
+    assert "2026-01-15 00:00:00+00:00" in sql
+
+
+def test_naive_datetime_literal_unchanged():
+    """Naive datetimes are unaffected by the tz-aware handling."""
+    assert create_sqlglot_literal(datetime(2026, 1, 15, 12, 30)).sql() == "'2026-01-15 12:30:00'"
+
+
+def test_clickhouse_datetime_literal_returns_none_on_overflow():
+    """Rendering bails out (returns None) when a datetime can't be represented.
+
+    A datetime beyond Python's year range has no representable form, so the helper returns None
+    and the caller skips pushdown rather than emit a truncated bound.
+    """
+    from polars_io_tools.io_sources.sql_utils import _clickhouse_datetime_literal
+
+    far_future = pl.lit(pl.Series([300_000_000_000_000], dtype=pl.Datetime("ms")))
+    assert _clickhouse_datetime_literal(far_future) is None
+
+
+def test_visit_literal_skips_pushdown_when_precision_unrecoverable(monkeypatch):
+    """When a ClickHouse datetime can't be rendered, the clause is dropped, not truncated.
+
+    Real out-of-range datetimes raise earlier, so patch the renderer to exercise the guard
+    directly and confirm pushdown is abandoned (the exact client-side filter still applies).
+    """
+    import polars_io_tools.io_sources.sql_utils as su
+
+    monkeypatch.setattr(su, "_clickhouse_datetime_literal", lambda expr: None)
+    assert convert_predicate_to_sql(pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC), "clickhouse") is None
+
+
+def test_naive_datetime_clickhouse_uses_todatetime64_without_tz():
+    """Naive datetimes on ClickHouse render as toDateTime64 without a timezone argument."""
+    sql = convert_predicate_to_sql(pl.col("ts") >= datetime(2024, 1, 15, 12, 30), "clickhouse").sql(dialect="clickhouse")
+    assert "toDateTime64('2024-01-15 12:30:00', 6)" in sql
+    assert "'UTC'" not in sql
+
+
+def test_nanosecond_datetime_pushdown_clickhouse_preserves_precision():
+    """A nanosecond-column filter pushes down with full precision on ClickHouse (PR #54 review).
+
+    Equality on a ``Datetime(ns)`` column becomes a nanosecond ``is_between`` whose bounds
+    collapse to the same microsecond through Python ``datetime``. If the pushdown kept only the
+    microsecond value, ClickHouse would drop matching ``DateTime64(9)`` rows before the
+    client-side filter. The two bounds must survive as distinct 9-digit ``toDateTime64`` values.
+    """
+    from polars.io.plugins import register_io_source
+
+    captured: dict[str, pl.Expr] = {}
+
+    def source(with_columns, predicate, n_rows, batch_size):
+        captured["predicate"] = predicate
+        ts = pl.Series("ts", [1705276800123456789], dtype=pl.Int64).cast(pl.Datetime("ns", "UTC"))
+        yield pl.DataFrame({"ts": ts})
+
+    lf = register_io_source(source, schema={"ts": pl.Datetime("ns", "UTC")})
+    lf.filter(pl.col("ts") == datetime(2024, 1, 15, 0, 0, 0, 123456, tzinfo=UTC)).collect()
+
+    sql = convert_predicate_to_sql(captured["predicate"], "clickhouse").sql(dialect="clickhouse")
+    assert "toDateTime64('2024-01-15 00:00:00.123456000', 9, 'UTC')" in sql
+    assert "toDateTime64('2024-01-15 00:00:00.123456999', 9, 'UTC')" in sql
 
 
 def test_visit_function_is_null():

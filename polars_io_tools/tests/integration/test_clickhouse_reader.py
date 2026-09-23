@@ -13,6 +13,7 @@ run explicitly when a ClickHouse endpoint is available via:
 """
 
 import logging
+from datetime import UTC, datetime
 
 import polars as pl
 import pytest
@@ -26,6 +27,8 @@ pytestmark = pytest.mark.clickhouse_required
 TEST_DB = "polars_io_tools_test"
 QUOTE_BAR_TABLE = f"{TEST_DB}.quote_bar_10m"
 TRADE_BAR_TABLE = f'"{TEST_DB}"."trade_bar_5m"'
+# Raw tick quotes carry nanosecond event timestamps (bars are coarse aggregates, so they don't).
+RAW_QUOTES_TABLE = f"{TEST_DB}.raw_quotes"
 
 
 def _clickhouse_command(sql: str, url: str, params: dict) -> str:
@@ -114,6 +117,33 @@ def _seed_tables(ch_params):
             ('BBB', 1, 20.5, 200, 20.4),
             ('CCC', 2, 30.5, 300, 30.4),
             ('AAA', 2, 15.5, 150, 15.4)
+        """,
+        url,
+        params,
+    )
+
+    # Raw quotes: tick-level rows with a nanosecond, tz-aware event timestamp. The two AAA rows
+    # share the same microsecond but differ in the nanosecond digits, which exercises datetime
+    # pushdown precision (a microsecond-truncating pushdown would drop the sub-microsecond row).
+    _clickhouse_command(
+        f"""
+        CREATE TABLE {RAW_QUOTES_TABLE} (
+            instrument String,
+            event_time DateTime64(9, 'UTC'),
+            bid Float64,
+            ask Float64
+        ) ENGINE = MergeTree() ORDER BY (instrument, event_time)
+        """,
+        url,
+        params,
+    )
+    _clickhouse_command(
+        f"""
+        INSERT INTO {RAW_QUOTES_TABLE} (instrument, event_time, bid, ask)
+        VALUES
+            ('AAA', '2024-01-15 00:00:00.123456000', 10.00, 10.01),
+            ('AAA', '2024-01-15 00:00:00.123456789', 10.02, 10.03),
+            ('BBB', '2024-01-16 12:30:00.000000000', 20.00, 20.01)
         """,
         url,
         params,
@@ -596,3 +626,39 @@ def test_predicate_pushdown_logged(ch_params, caplog):
     pushed = _pushed_down_sql(caplog)
     assert pushed, "expected the reader to log a pushed-down SQL statement"
     assert any("WHERE" in sql.upper() and "active" in sql.lower() for sql in pushed)
+
+
+def test_filter_timezone_aware_datetime(ch_params):
+    """A timezone-aware datetime filter on a DateTime64(_, 'UTC') column pushes down and works.
+
+    The reader previously emitted an offset-bearing string that ClickHouse rejects (HTTP 400);
+    it must now round-trip and return the expected rows.
+    """
+    url, params = ch_params
+    base = f"SELECT instrument, event_time FROM {RAW_QUOTES_TABLE}"
+    result = cpl.scan_clickhouse(base, url, params).filter(pl.col("event_time") >= datetime(2024, 1, 16, tzinfo=UTC)).collect()
+
+    assert result["instrument"].to_list() == ["BBB"]
+
+
+def test_filter_nanosecond_precision_not_truncated(ch_params, caplog):
+    """A microsecond-precision filter on a DateTime64(9) column keeps sub-microsecond rows.
+
+    Equality against a nanosecond column matches the whole microsecond bucket, so both the
+    ``.123456000`` and ``.123456789`` rows qualify. If pushdown truncated the bound to
+    microseconds, ClickHouse would drop the ``.123456789`` row before the client-side filter,
+    so returning both rows proves the nanosecond bounds survive pushdown.
+    """
+    url, params = ch_params
+    caplog.set_level(logging.DEBUG)
+
+    base = f"SELECT instrument, event_time, bid FROM {RAW_QUOTES_TABLE}"
+    result = cpl.scan_clickhouse(base, url, params).filter(pl.col("event_time") == datetime(2024, 1, 15, 0, 0, 0, 123456, tzinfo=UTC)).collect()
+
+    # Both AAA rows share microsecond .123456 but differ in nanoseconds; both must be returned.
+    assert result.height == 2
+    assert set(result["instrument"].to_list()) == {"AAA"}
+
+    # The pushed SQL must carry the full nanosecond upper bound, not a collapsed microsecond one.
+    pushed = _pushed_down_sql(caplog)
+    assert any("toDateTime64('2024-01-15 00:00:00.123456999', 9, 'UTC')" in sql for sql in pushed), pushed
