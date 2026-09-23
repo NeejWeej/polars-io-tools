@@ -712,6 +712,18 @@ def test_filtered_join_asof_basic_backward(include_id, filters, on_same_column, 
     assert_frame_equal(result, expected)
 
 
+def test_filtered_join_asof_collects_do_not_retain_previous_filters():
+    left = pl.LazyFrame({"d": [date(2025, 1, 2), date(2025, 1, 11)]}).set_sorted("d")
+    right = pl.LazyFrame({"d": [date(2025, 1, 1), date(2025, 1, 10)], "value": [10, 20]}).set_sorted("d")
+    kwargs = {"on": "d", "tolerance": timedelta(days=2)}
+    joined = left.piot.filtered_join_asof(right, **kwargs)
+    expected = left.join_asof(right, **kwargs)
+
+    for predicate in (pl.col("d") >= date(2025, 1, 10), pl.col("d") <= date(2025, 1, 2)):
+        assert_frame_equal(joined.filter(predicate).collect(), expected.filter(predicate).collect())
+    assert_frame_equal(joined.collect(), expected.collect())
+
+
 def test_filtered_join_asof_empty_left_dataframe():
     """Test filtered_join_asof with empty left DataFrame."""
     df_left_empty = pl.DataFrame({"timestamp": [], "value": []}, schema={"timestamp": pl.Datetime, "value": pl.Float64}).with_columns(
