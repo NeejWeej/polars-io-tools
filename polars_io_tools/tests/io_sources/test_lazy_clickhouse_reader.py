@@ -13,6 +13,7 @@ from urllib3.response import HTTPResponse
 
 import polars_io_tools as cpl
 from polars_io_tools import io_sources as polars_utils
+from polars_io_tools._compat import POLARS_HAS_COLLECT_BATCHES
 from polars_io_tools.io_sources.lazy_clickhouse_reader import get_batch_reader_http
 
 """
@@ -201,6 +202,70 @@ def test_scan_clickhouse_decodes_http_response(monkeypatch, content_encoding, em
     finally:
         for response in responses:
             response.close()
+
+
+def _capture_reader_calls(monkeypatch):
+    calls = []
+
+    def capturing_reader(query, url, params, **kwargs):
+        calls.append({"query": query, "params": dict(params), "kwargs": dict(kwargs)})
+        return fake_get_batch_reader_http(query, url, params, **kwargs)
+
+    monkeypatch.setattr(polars_utils.lazy_clickhouse_reader, "get_batch_reader_http", capturing_reader)
+    return calls
+
+
+def test_scan_clickhouse_forwards_timeout_to_schema_and_data(monkeypatch):
+    calls = _capture_reader_calls(monkeypatch)
+    timeout = (2, 30)
+
+    cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, FAKE_PARAMS, timeout=timeout).collect()
+
+    assert len(calls) == 2
+    assert all(call["kwargs"]["timeout"] == timeout for call in calls)
+
+
+def test_scan_clickhouse_uses_fetch_size_as_block_size(monkeypatch):
+    calls = _capture_reader_calls(monkeypatch)
+
+    cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, FAKE_PARAMS, fetch_size=321).collect()
+
+    data_calls = [call for call in calls if "LIMIT 0" not in call["query"]]
+    assert [call["params"]["max_block_size"] for call in data_calls] == [321]
+
+
+@pytest.mark.skipif(not POLARS_HAS_COLLECT_BATCHES, reason="collect_batches requires Polars >= 1.34.0")
+def test_scan_clickhouse_runtime_batch_size_overrides_fetch_size(monkeypatch):
+    ch_mod = polars_utils.lazy_clickhouse_reader
+    original_register = ch_mod.register_io_source_with_is_pure
+    runtime_batch_sizes = []
+
+    def capturing_register(source, *args, **kwargs):
+        def capturing_source(with_columns, predicate, n_rows, batch_size):
+            runtime_batch_sizes.append(batch_size)
+            yield from source(with_columns, predicate, n_rows, batch_size)
+
+        return original_register(capturing_source, *args, **kwargs)
+
+    monkeypatch.setattr(ch_mod, "register_io_source_with_is_pure", capturing_register)
+    calls = _capture_reader_calls(monkeypatch)
+    lf = cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, FAKE_PARAMS, fetch_size=321)
+
+    list(lf.collect_batches(chunk_size=2))
+
+    data_calls = [call for call in calls if "LIMIT 0" not in call["query"]]
+    assert runtime_batch_sizes
+    assert [call["params"]["max_block_size"] for call in data_calls] == runtime_batch_sizes
+
+
+def test_scan_clickhouse_preserves_explicit_max_block_size(monkeypatch):
+    calls = _capture_reader_calls(monkeypatch)
+    params = {"max_block_size": 777}
+
+    cpl.scan_clickhouse("SELECT CenterID FROM CC_Bond", FAKE_URL, params, fetch_size=321).collect()
+
+    assert all(call["params"]["max_block_size"] == 777 for call in calls)
+    assert params == {"max_block_size": 777}
 
 
 def test_basic_query():

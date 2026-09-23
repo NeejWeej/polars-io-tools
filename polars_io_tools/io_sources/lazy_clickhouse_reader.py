@@ -80,7 +80,9 @@ def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000,
             # so streamed Arrow batches are sized accordingly. max_block_size is a plain HTTP
             # setting and a hint, not a hard guarantee on record-batch size.
             block_size = batch_size if batch_size is not None else fetch_size
-            ch_params = params | {"max_block_size": block_size} if block_size > 0 else params
+            ch_params = dict(params)
+            if block_size > 0:
+                ch_params.setdefault("max_block_size", block_size)
             reader = get_batch_reader_http(final_sql, url, ch_params, timeout=timeout)
 
             # Track if we've yielded any batches yet
