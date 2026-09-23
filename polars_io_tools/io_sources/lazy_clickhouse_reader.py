@@ -22,26 +22,29 @@ __all__ = ("scan_clickhouse",)
 # Configure logging
 log = logging.getLogger(__name__)
 
+# Default (connect, read) timeout for the HTTP request. A connect timeout guards against an
+# unreachable host; ``None`` for the read timeout so a long-running query that keeps streaming
+# rows is never interrupted. Overridable via the ``timeout`` argument of ``scan_clickhouse``.
+_HTTP_TIMEOUT = (10, None)
 
-def get_batch_reader_http(query: str, url: str, params: dict):
+
+def get_batch_reader_http(query: str, url: str, params: dict, timeout=_HTTP_TIMEOUT):
     query = f"{query} FORMAT ArrowStream"
-    r = requests.post(url, params=(params | {"query": query}), stream=True)
+    r = requests.post(url, params=(params | {"query": query}), stream=True, timeout=timeout)
     r.raise_for_status()
     # Requests leaves raw responses encoded; decode HTTP compression as Arrow reads.
     r.raw.decode_content = True
     return pa.ipc.open_stream(r.raw)
 
 
-def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000, description: str | None = None):
-    # TODO: fetch_size param needs to be properly handled
-    log.warning("fetch_size=%d is currently ignored and has no effect. Proper fetch_size support will be added in a future release.", fetch_size)
+def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000, description: str | None = None, *, timeout=_HTTP_TIMEOUT):
     dialect = "clickhouse"
     parsed_query = parse_one(query, dialect=dialect)
     schema_query_parsed = parsed_query.copy().limit(0, dialect=dialect)
     identifier_parsed = schema_query_parsed.transform(fix_three_part_identifiers)
     schema_query = identifier_parsed.sql(dialect=dialect)
     try:
-        reader = get_batch_reader_http(schema_query, url, params)
+        reader = get_batch_reader_http(schema_query, url, params, timeout=timeout)
         arrow_schema = reader.schema
         df = pl.DataFrame(pa.Table.from_pylist([], schema=arrow_schema))
         schema = dict(df.schema)
@@ -73,9 +76,14 @@ def scan_clickhouse(query: str, url: str, params: dict, fetch_size: int = 10000,
         log.debug(f"Executing SQL with pushdown: {final_sql}")
 
         try:
-            # TODO: Support batch_size
-            # TODO: Support kwargs and whatever they might mean in clickhouse's context
-            reader = get_batch_reader_http(final_sql, url, params)
+            # Map the Polars batch size (or the fetch_size default) to ClickHouse's block size
+            # so streamed Arrow batches are sized accordingly. max_block_size is a plain HTTP
+            # setting and a hint, not a hard guarantee on record-batch size.
+            block_size = batch_size if batch_size is not None else fetch_size
+            ch_params = dict(params)
+            if block_size > 0:
+                ch_params.setdefault("max_block_size", block_size)
+            reader = get_batch_reader_http(final_sql, url, ch_params, timeout=timeout)
 
             # Track if we've yielded any batches yet
             # This is necessary in case the query yields
