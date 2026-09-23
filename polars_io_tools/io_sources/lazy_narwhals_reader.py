@@ -97,10 +97,13 @@ class _NWBuilder(ExprVisitor[Any | None]):
 
         op = node.op
         try:
-            if op in (OperatorType.EQ, OperatorType.EQ_VALIDITY):
+            if op == OperatorType.EQ:
                 self.expr = left == right
-            elif op in (OperatorType.NOT_EQ, OperatorType.NOT_EQ_VALIDITY):
+            elif op == OperatorType.NOT_EQ:
                 self.expr = left != right
+            elif op in (OperatorType.EQ_VALIDITY, OperatorType.NOT_EQ_VALIDITY):
+                equal_with_nulls = (left == right).fill_null(False) | (left.is_null() & right.is_null())
+                self.expr = equal_with_nulls if op == OperatorType.EQ_VALIDITY else ~equal_with_nulls
             elif op == OperatorType.GT:
                 self.expr = left > right
             elif op == OperatorType.GT_EQ:
@@ -148,7 +151,15 @@ class _NWBuilder(ExprVisitor[Any | None]):
             elif ft == BooleanFunctionType.IS_IN and len(node.inputs) >= 2:
                 val_node = node.inputs[1]
                 if val_node.can_extract_literal:
-                    self.expr = col_expr.is_in(val_node.value)
+                    values = val_node.value
+                    if node.options.get("nulls_equal", False):
+                        # Polars currently accepts scalar RHS values for is_in, but that usage is deprecated.
+                        members = values if isinstance(values, (list, tuple, set, frozenset)) else [values]
+                        non_null = [value for value in members if value is not None]
+                        membership = col_expr.is_in(non_null).fill_null(False)
+                        self.expr = membership | col_expr.is_null() if len(non_null) != len(members) else membership
+                    else:
+                        self.expr = col_expr.is_in(values)
                 else:
                     self.expr = None
         else:
