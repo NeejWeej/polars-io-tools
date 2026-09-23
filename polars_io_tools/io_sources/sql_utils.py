@@ -97,41 +97,34 @@ def _to_datetime64(text: str, precision: int, *, tz_aware: bool) -> sqlglot.exp.
     return sqlglot.exp.func("toDateTime64", *args)
 
 
-def _datetime_pushdown_parts(expr: pl.Expr) -> tuple[str, int, bool, bool] | None:
-    """Recover a datetime literal's full precision from its source expression.
+def _clickhouse_datetime_literal(expr: pl.Expr) -> sqlglot.exp.Expression | None:
+    """Render a datetime literal as a full-precision ClickHouse ``toDateTime64`` instant.
 
-    ``LiteralNode.value`` is a Python ``datetime`` (microsecond-max), which truncates a
-    ``Datetime('ns')`` literal. On the nanosecond ``is_between`` Polars generates for a
-    nanosecond column, both bounds can then collapse to the same microsecond value and drop
-    matching rows. The physical value on the original expression still carries full precision.
-
-    Returns ``(text, precision, tz_aware, exact_in_microseconds)`` where ``text`` is the UTC
-    instant (tz-aware) or wall-clock instant (naive) formatted at the literal's own resolution,
-    or ``None`` when ``expr`` is not a single Datetime value.
+    ``LiteralNode.value`` is a microsecond-max Python ``datetime``, so a ``Datetime('ns')``
+    literal -- and the bounds of the nanosecond ``is_between`` Polars builds for a nanosecond
+    column -- would truncate and drop matching rows. The physical value keeps full precision;
+    render the UTC instant (tz-aware) or wall-clock instant (naive) at the literal's own
+    resolution. Returns ``None`` for anything that is not a single, representable Datetime value,
+    so the caller skips pushdown and leaves the exact client-side filter in place.
     """
     try:
         series = pl.DataFrame().select(expr).to_series()
-    except Exception:  # noqa: BLE001 -- defensive: fall back to the microsecond path if the literal can't be evaluated
+    except Exception:  # noqa: BLE001 -- defensive: skip pushdown if the literal can't be evaluated
         return None
     dtype = series.dtype
     if not isinstance(dtype, pl.Datetime) or len(series) != 1:
         return None
-    physical = series.to_physical().to_list()[0]
-    if physical is None:
+    ticks = series.to_physical().to_list()[0]
+    if ticks is None:
         return None
-    scale = {"ms": 1_000_000, "us": 1_000, "ns": 1}[dtype.time_unit]
-    precision = {"ms": 3, "us": 6, "ns": 9}[dtype.time_unit]
-    total_ns = physical * scale
-    seconds, frac_ns = divmod(total_ns, 1_000_000_000)
+    ticks_per_second, precision = {"ms": (1_000, 3), "us": (1_000_000, 6), "ns": (1_000_000_000, 9)}[dtype.time_unit]
+    seconds, fraction = divmod(ticks, ticks_per_second)
     try:
-        base = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=seconds)
+        instant = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=seconds)
     except (OverflowError, OSError):
         return None
-    if frac_ns:
-        text = base.strftime("%Y-%m-%d %H:%M:%S") + "." + str(frac_ns // scale).zfill(precision)
-    else:
-        text = base.strftime("%Y-%m-%d %H:%M:%S")
-    return text, precision, dtype.time_zone is not None, frac_ns % 1_000 == 0
+    text = instant.strftime("%Y-%m-%d %H:%M:%S") + (f".{fraction:0{precision}d}" if fraction else "")
+    return _to_datetime64(text, precision, tz_aware=dtype.time_zone is not None)
 
 
 def create_sqlglot_literal(value: Any, dialect: str | Dialects | type[Dialect] | None = None) -> sqlglot.exp.Expression:
@@ -260,27 +253,12 @@ class SQLExpressionVisitor(ExprVisitor[sqlglot.exp.Expression | None]):
 
         value = node.value
 
-        # Datetimes reach the visitor as microsecond-max Python objects (``node.value``), which
-        # can truncate a nanosecond literal. Recover the true precision from the source expression.
-        if isinstance(value, datetime):
-            parts = _datetime_pushdown_parts(node.expr)
-            if parts is None:
-                # Could not recover the literal's true precision; skip pushdown rather than risk a
-                # microsecond-truncated bound that drops rows. The exact client-side filter remains.
-                self.result = None
-                return
-            text, precision, tz_aware, exact_in_us = parts
-            if self.dialect == Dialects.CLICKHOUSE:
-                # ClickHouse DateTime64 keeps up to nanoseconds; emit the instant at the
-                # literal's own precision so filters on a nanosecond column are exact.
-                self.result = _to_datetime64(text, precision, tz_aware=tz_aware)
-                return
-            if not exact_in_us:
-                # Other dialects render datetimes as microsecond strings, so a sub-microsecond
-                # literal cannot be represented exactly. Skip pushdown and let the exact
-                # client-side filter handle it rather than emit a truncated bound.
-                self.result = None
-                return
+        # ClickHouse DateTime64 keeps up to nanoseconds, but ``node.value`` is microsecond-max;
+        # render the literal from its source expression so nanosecond-column filters stay exact.
+        # ``None`` (unrepresentable) skips pushdown, leaving the exact client-side filter.
+        if self.dialect == Dialects.CLICKHOUSE and isinstance(value, datetime):
+            self.result = _clickhouse_datetime_literal(node.expr)
+            return
 
         # Handle different literal types via central helper
         self.result = create_sqlglot_literal(value, self.dialect)

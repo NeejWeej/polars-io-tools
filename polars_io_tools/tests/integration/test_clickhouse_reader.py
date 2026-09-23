@@ -661,4 +661,4 @@ def test_filter_nanosecond_precision_not_truncated(ch_params, caplog):
 
     # The pushed SQL must carry the full nanosecond upper bound, not a collapsed microsecond one.
     pushed = _pushed_down_sql(caplog)
-    assert any("123456999" in sql for sql in pushed), pushed
+    assert any("toDateTime64('2024-01-15 00:00:00.123456999', 9, 'UTC')" in sql for sql in pushed), pushed

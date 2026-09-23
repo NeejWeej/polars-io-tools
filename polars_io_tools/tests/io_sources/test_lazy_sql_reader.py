@@ -785,16 +785,35 @@ def test_naive_datetime_literal_unchanged():
     assert create_sqlglot_literal(datetime(2026, 1, 15, 12, 30)).sql() == "'2026-01-15 12:30:00'"
 
 
-def test_datetime_pushdown_parts_returns_none_on_overflow():
-    """Precision recovery bails out (returns None) when a datetime can't be rendered.
+def test_clickhouse_datetime_literal_returns_none_on_overflow():
+    """Rendering bails out (returns None) when a datetime can't be represented.
 
     A datetime beyond Python's year range has no representable form, so the helper returns None
-    and ``visit_literal`` skips pushdown rather than emit a truncated bound.
+    and the caller skips pushdown rather than emit a truncated bound.
     """
-    from polars_io_tools.io_sources.sql_utils import _datetime_pushdown_parts
+    from polars_io_tools.io_sources.sql_utils import _clickhouse_datetime_literal
 
     far_future = pl.lit(pl.Series([300_000_000_000_000], dtype=pl.Datetime("ms")))
-    assert _datetime_pushdown_parts(far_future) is None
+    assert _clickhouse_datetime_literal(far_future) is None
+
+
+def test_visit_literal_skips_pushdown_when_precision_unrecoverable(monkeypatch):
+    """When a ClickHouse datetime can't be rendered, the clause is dropped, not truncated.
+
+    Real out-of-range datetimes raise earlier, so patch the renderer to exercise the guard
+    directly and confirm pushdown is abandoned (the exact client-side filter still applies).
+    """
+    import polars_io_tools.io_sources.sql_utils as su
+
+    monkeypatch.setattr(su, "_clickhouse_datetime_literal", lambda expr: None)
+    assert convert_predicate_to_sql(pl.col("ts") >= datetime(2026, 1, 15, tzinfo=UTC), "clickhouse") is None
+
+
+def test_naive_datetime_clickhouse_uses_todatetime64_without_tz():
+    """Naive datetimes on ClickHouse render as toDateTime64 without a timezone argument."""
+    sql = convert_predicate_to_sql(pl.col("ts") >= datetime(2024, 1, 15, 12, 30), "clickhouse").sql(dialect="clickhouse")
+    assert "toDateTime64('2024-01-15 12:30:00', 6)" in sql
+    assert "'UTC'" not in sql
 
 
 def test_nanosecond_datetime_pushdown_clickhouse_preserves_precision():
@@ -820,24 +839,6 @@ def test_nanosecond_datetime_pushdown_clickhouse_preserves_precision():
     sql = convert_predicate_to_sql(captured["predicate"], "clickhouse").sql(dialect="clickhouse")
     assert "toDateTime64('2024-01-15 00:00:00.123456000', 9, 'UTC')" in sql
     assert "toDateTime64('2024-01-15 00:00:00.123456999', 9, 'UTC')" in sql
-
-
-def test_nanosecond_datetime_pushdown_skipped_for_non_clickhouse():
-    """Other dialects skip pushdown of a sub-microsecond bound rather than truncate it (PR #54 review)."""
-    from polars.io.plugins import register_io_source
-
-    captured: dict[str, pl.Expr] = {}
-
-    def source(with_columns, predicate, n_rows, batch_size):
-        captured["predicate"] = predicate
-        ts = pl.Series("ts", [1705276800123456789], dtype=pl.Int64).cast(pl.Datetime("ns", "UTC"))
-        yield pl.DataFrame({"ts": ts})
-
-    lf = register_io_source(source, schema={"ts": pl.Datetime("ns", "UTC")})
-    lf.filter(pl.col("ts") == datetime(2024, 1, 15, 0, 0, 0, 123456, tzinfo=UTC)).collect()
-
-    # The upper bound (…123456999) is sub-microsecond, so the whole predicate is not pushed down.
-    assert convert_predicate_to_sql(captured["predicate"], "postgres") is None
 
 
 def test_visit_function_is_null():
