@@ -2423,5 +2423,83 @@ class TestIntervalFilterSpecConservative:
         assert end_lower == date(2024, 1, 1)
 
 
+class TestSharedSourceColUnion:
+    """Two or more output columns mapping to the same source column union their discrete filters.
+
+    A self-join over one source builds every pair of ``group`` values, exposing ``group1``/``group2``
+    output columns that both derive from the source's single ``group`` column. A filter constrains the
+    output *pair*; a source row is relevant if it can serve *any* output column mapped to that source
+    column, so the correct source predicate is the union across those columns (not the intersection).
+    """
+
+    @staticmethod
+    def _three_group_source():
+        return pl.DataFrame(
+            {
+                "data_date": [date(2024, 1, 1)] * 3,
+                "group": ["A", "B", "C"],
+                "val": [1.0, 2.0, 3.0],
+            }
+        )
+
+    @staticmethod
+    def _combine(s):
+        # Self-join to build cross-group pairs, exposing group1/group2 from source `group`.
+        left = s["src"].rename({"group": "group1", "val": "val1"})
+        right = s["src"].select(
+            "data_date",
+            pl.col("group").alias("group2"),
+            pl.col("val").alias("val2"),
+        )
+        return left.join(right, on="data_date").filter(pl.col("group1") != pl.col("group2"))
+
+    @classmethod
+    def _build(cls, source_lf):
+        return pushdown_combine(
+            sources={
+                "src": (
+                    source_lf,
+                    {
+                        "data_date": FilterSpec(),
+                        "group1": FilterSpec(source_col="group"),
+                        "group2": FilterSpec(source_col="group"),
+                    },
+                )
+            },
+            combine=cls._combine,
+        )
+
+    def test_lone_side_filter_returns_all_partners(self):
+        out = self._build(self._three_group_source().lazy()).filter(pl.col("group1") == "A").collect()
+        # A paired with all other groups, not empty.
+        assert set(out["group2"]) == {"B", "C"}
+
+    def test_both_sides_filter_unions_to_is_in(self):
+        out = (
+            self._build(self._three_group_source().lazy())
+            .filter((pl.col("group1") == "A") & (pl.col("group2") == "B"))
+            .collect()
+        )
+        assert out.height == 1
+        assert out["group1"][0] == "A"
+        assert out["group2"][0] == "B"
+
+    def test_both_sides_pushes_union_is_in(self):
+        tracker = PredicateTracker(self._three_group_source())
+        self._build(tracker.lazy_frame).filter((pl.col("group1") == "A") & (pl.col("group2") == "B")).collect()
+        analyzer = tracker.get_analyzer()
+        f = analyzer.find_discrete_filter("group")
+        assert f is not None
+        assert analyzer.extract_discrete_values(f) == {"A", "B"}  # union pushed to the scan
+
+    def test_lone_side_pushes_no_group_predicate(self):
+        tracker = PredicateTracker(self._three_group_source())
+        self._build(tracker.lazy_frame).filter(pl.col("group1") == "A").collect()
+        # group2 unconstrained -> union is the full universe -> source must keep all groups.
+        # Either no predicate reaches the source, or it carries no discrete `group` filter.
+        if tracker.last_predicate is not None:
+            assert tracker.get_analyzer().find_discrete_filter("group") is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
