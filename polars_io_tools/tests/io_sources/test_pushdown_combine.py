@@ -2549,9 +2549,10 @@ class TestSharedSourceColUnion:
     def test_value_mapping_union_of_mapped_values(self):
         # Two shared-source specs each with a value_mapping -> union of the MAPPED values.
         df = pl.DataFrame({"code": ["a", "b", "c"]})
-        combine = lambda s: s["src"].rename({"code": "name1"}).join(
-            s["src"].select(pl.col("code").alias("name2")), how="cross"
-        )
+
+        def combine(s):
+            return s["src"].rename({"code": "name1"}).join(s["src"].select(pl.col("code").alias("name2")), how="cross")
+
         specs = {
             "name1": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b", "C": "c"}),
             "name2": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b", "C": "c"}),
@@ -2598,9 +2599,10 @@ class TestSharedSourceColUnion:
     def test_non_shared_column_in_same_source_unaffected(self):
         # A column that does NOT share a source col still pushes its own discrete filter.
         df = pl.DataFrame({"group": ["A", "B", "C"], "other": ["x", "y", "z"]})
-        combine = lambda s: s["src"].rename({"group": "group1"}).join(
-            s["src"].select(pl.col("group").alias("group2")), how="cross"
-        )
+
+        def combine(s):
+            return s["src"].rename({"group": "group1"}).join(s["src"].select(pl.col("group").alias("group2")), how="cross")
+
         specs = {
             "group1": FilterSpec(source_col="group"),
             "group2": FilterSpec(source_col="group"),
@@ -2646,6 +2648,29 @@ class TestSharedSourceColUnion:
         f = analyzer.find_discrete_filter("d")
         assert f is not None
         assert analyzer.extract_discrete_values(f) == {date(2024, 1, 2)}
+
+    def test_union_with_unorderable_values_does_not_crash(self):
+        # The union may contain unorderable values (e.g. None mixed with strings). The pushed is_in must
+        # not sort them, or collect() would raise TypeError. A lone (non-shared) column already tolerates
+        # this via list(...); a shared source col must behave the same.
+        df = pl.DataFrame({"group": ["A", "B", None]})
+
+        def combine(s):
+            return s["src"].rename({"group": "group1"}).join(s["src"].select(pl.col("group").alias("group2")), how="cross")
+
+        specs = {
+            "group1": FilterSpec(source_col="group"),
+            "group2": FilterSpec(source_col="group"),
+        }
+        tracker = PredicateTracker(df)
+        # group1 in {None, "A"} unions with group2 == "B" -> {None, "A", "B"} (unorderable set).
+        pushdown_combine(sources={"src": (tracker.lazy_frame, specs)}, combine=combine).filter(
+            (pl.col("group1").is_null() | (pl.col("group1") == "A")) & (pl.col("group2") == "B")
+        ).collect()
+        analyzer = tracker.get_analyzer()
+        f = analyzer.find_discrete_filter("group")
+        assert f is not None
+        assert analyzer.extract_discrete_values(f) == {None, "A", "B"}
 
 
 if __name__ == "__main__":

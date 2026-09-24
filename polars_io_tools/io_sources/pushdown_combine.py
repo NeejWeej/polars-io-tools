@@ -238,7 +238,7 @@ def _union_discrete_filter(
         safely pushed; defer to the post-combine predicate).
 
     Otherwise returns ``pl.col(source_col) == v`` (union size 1) or
-    ``pl.col(source_col).is_in(sorted(union))`` (size > 1). Each member's values are mapped through that
+    ``pl.col(source_col).is_in(list(union))`` (size > 1). Each member's values are mapped through that
     member's own ``spec.value_mapping`` before unioning.
     """
     union: set[Any] = set()
@@ -258,7 +258,9 @@ def _union_discrete_filter(
 
     if len(union) == 1:
         return pl.col(source_col) == next(iter(union))
-    return pl.col(source_col).is_in(sorted(union))
+    # Do not sort: the union may contain unorderable values (e.g. None mixed with strings), and the
+    # single-member fast path uses an unsorted list(...) too. is_in does not require ordering.
+    return pl.col(source_col).is_in(list(union))
 
 
 # Endpoint comparison operators per ``closed`` mode. ``lower`` is the ``end_col >= lo`` side (left
