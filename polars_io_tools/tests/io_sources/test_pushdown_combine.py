@@ -2475,11 +2475,7 @@ class TestSharedSourceColUnion:
         assert set(out["group2"]) == {"B", "C"}
 
     def test_both_sides_filter_unions_to_is_in(self):
-        out = (
-            self._build(self._three_group_source().lazy())
-            .filter((pl.col("group1") == "A") & (pl.col("group2") == "B"))
-            .collect()
-        )
+        out = self._build(self._three_group_source().lazy()).filter((pl.col("group1") == "A") & (pl.col("group2") == "B")).collect()
         assert out.height == 1
         assert out["group1"][0] == "A"
         assert out["group2"][0] == "B"
@@ -2502,9 +2498,7 @@ class TestSharedSourceColUnion:
 
     def test_is_in_both_sides_unions(self):
         tracker = PredicateTracker(self._three_group_source())
-        self._build(tracker.lazy_frame).filter(
-            pl.col("group1").is_in(["A", "B"]) & pl.col("group2").is_in(["B", "C"])
-        ).collect()
+        self._build(tracker.lazy_frame).filter(pl.col("group1").is_in(["A", "B"]) & pl.col("group2").is_in(["B", "C"])).collect()
         analyzer = tracker.get_analyzer()
         f = analyzer.find_discrete_filter("group")
         assert f is not None
@@ -2626,9 +2620,7 @@ class TestSharedSourceColUnion:
                 "val": [1, 2, 3],
             }
         )
-        combine = lambda s: s["src"].rename({"d": "d1"}).join(
-            s["src"].select(pl.col("d").alias("d2")), how="cross"
-        )
+        combine = lambda s: s["src"].rename({"d": "d1"}).join(s["src"].select(pl.col("d").alias("d2")), how="cross")
         specs = {
             "d1": FilterSpec(source_col="d", lookback=timedelta(days=2)),
             "d2": FilterSpec(source_col="d"),
