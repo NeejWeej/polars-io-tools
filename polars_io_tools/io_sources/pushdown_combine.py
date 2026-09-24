@@ -531,6 +531,16 @@ def pushdown_combine(
         2. Filter ``group1 == "A"`` alone (group2 unconstrained) -> no ``group`` predicate is pushed
         3. combine() runs and the original filter is applied, giving the exact requested pairs
 
+        This union applies to **discrete** (``==`` / ``is_in``) filters only. **Temporal** (date/datetime
+        range, ``lookback`` / ``lookahead``) specs that share a source column are still AND-**intersected**,
+        not unioned. This is intentional: unlike the discrete case, ``source_col`` sharing does not by
+        itself distinguish "alternative consumers" (which want a union) from "the same rows constrained
+        via several columns" (which want the intersection). ``ts_with_columns`` relies on the intersection
+        semantics (it maps ``index_col`` and every ``linked_col`` to one source column so the tightest
+        available constraint narrows the scan). As a result, two output *date* columns that share a source
+        column where one carries a ``lookback`` can intersect to an over-narrow (or empty) range; if you
+        need union-of-ranges semantics there, keep those columns on distinct source columns.
+
     Examples:
         Basic usage with lookback::
 
