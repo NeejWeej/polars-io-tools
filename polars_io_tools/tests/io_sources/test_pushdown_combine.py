@@ -2500,6 +2500,153 @@ class TestSharedSourceColUnion:
         if tracker.last_predicate is not None:
             assert tracker.get_analyzer().find_discrete_filter("group") is None
 
+    def test_is_in_both_sides_unions(self):
+        tracker = PredicateTracker(self._three_group_source())
+        self._build(tracker.lazy_frame).filter(
+            pl.col("group1").is_in(["A", "B"]) & pl.col("group2").is_in(["B", "C"])
+        ).collect()
+        analyzer = tracker.get_analyzer()
+        f = analyzer.find_discrete_filter("group")
+        assert f is not None
+        assert analyzer.extract_discrete_values(f) == {"A", "B", "C"}
+
+    def test_three_shared_columns_union(self):
+        # Three output columns sharing one source column: the generalization holds.
+        df = pl.DataFrame({"group": ["A", "B", "C"]})
+
+        def combine(s):
+            base = s["src"]
+            return (
+                base.rename({"group": "group1"})
+                .join(base.select(pl.col("group").alias("group2")), how="cross")
+                .join(base.select(pl.col("group").alias("group3")), how="cross")
+            )
+
+        three_specs = {
+            "group1": FilterSpec(source_col="group"),
+            "group2": FilterSpec(source_col="group"),
+            "group3": FilterSpec(source_col="group"),
+        }
+
+        # All three constrained -> union of the three values pushed.
+        tracker = PredicateTracker(df)
+        pushdown_combine(sources={"src": (tracker.lazy_frame, three_specs)}, combine=combine).filter(
+            (pl.col("group1") == "A") & (pl.col("group2") == "B") & (pl.col("group3") == "C")
+        ).collect()
+        analyzer = tracker.get_analyzer()
+        f = analyzer.find_discrete_filter("group")
+        assert f is not None
+        assert analyzer.extract_discrete_values(f) == {"A", "B", "C"}
+
+        # One of the three unconstrained -> push nothing for `group`.
+        tracker2 = PredicateTracker(df)
+        pushdown_combine(sources={"src": (tracker2.lazy_frame, three_specs)}, combine=combine).filter(
+            (pl.col("group1") == "A") & (pl.col("group2") == "B")
+        ).collect()
+        if tracker2.last_predicate is not None:
+            assert tracker2.get_analyzer().find_discrete_filter("group") is None
+
+    def test_value_mapping_union_of_mapped_values(self):
+        # Two shared-source specs each with a value_mapping -> union of the MAPPED values.
+        df = pl.DataFrame({"code": ["a", "b", "c"]})
+        combine = lambda s: s["src"].rename({"code": "name1"}).join(
+            s["src"].select(pl.col("code").alias("name2")), how="cross"
+        )
+        specs = {
+            "name1": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b", "C": "c"}),
+            "name2": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b", "C": "c"}),
+        }
+        tracker = PredicateTracker(df)
+        pushdown_combine(
+            sources={"src": (tracker.lazy_frame, specs)},
+            combine=combine,
+        ).filter((pl.col("name1") == "A") & (pl.col("name2") == "B")).collect()
+        analyzer = tracker.get_analyzer()
+        f = analyzer.find_discrete_filter("code")
+        assert f is not None
+        assert analyzer.extract_discrete_values(f) == {"a", "b"}  # mapped values, unioned
+
+    def test_value_mapping_unmapped_member_still_correct(self):
+        # One member yields an unmapped value -> the shared group's union pushdown is skipped, so the
+        # source supplies all rows and the post-combine predicate decides the result. Assert on the
+        # result (correctness) rather than the pushed predicate: Polars may still push the renamed
+        # post-combine predicate natively, which is independent of pushdown_combine's own pushdown.
+        df = pl.DataFrame({"code": ["a", "b", "c"]})
+
+        def combine(s):
+            # Map source `code` back to output names on BOTH sides so the output columns exist.
+            code_to_name = {"a": "A", "b": "B", "c": "C"}
+            left = s["src"].with_columns(pl.col("code").replace(code_to_name).alias("name1")).drop("code")
+            right = s["src"].with_columns(pl.col("code").replace(code_to_name).alias("name2")).drop("code")
+            return left.join(right, how="cross")
+
+        specs = {
+            "name1": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b", "C": "c"}),
+            # Partial mapping for name2: "C" is intentionally absent.
+            "name2": FilterSpec(source_col="code", value_mapping={"A": "a", "B": "b"}),
+        }
+        # name2 == "C" is unmapped for name2 -> group skipped, but the result must still be correct.
+        out = (
+            pushdown_combine(sources={"src": (df.lazy(), specs)}, combine=combine)
+            .filter((pl.col("name1") == "A") & (pl.col("name2") == "C"))
+            .collect()
+        )
+        assert out.height == 1
+        assert out["name1"][0] == "A"
+        assert out["name2"][0] == "C"
+
+    def test_non_shared_column_in_same_source_unaffected(self):
+        # A column that does NOT share a source col still pushes its own discrete filter.
+        df = pl.DataFrame({"group": ["A", "B", "C"], "other": ["x", "y", "z"]})
+        combine = lambda s: s["src"].rename({"group": "group1"}).join(
+            s["src"].select(pl.col("group").alias("group2")), how="cross"
+        )
+        specs = {
+            "group1": FilterSpec(source_col="group"),
+            "group2": FilterSpec(source_col="group"),
+            "other": FilterSpec(),
+        }
+        tracker = PredicateTracker(df)
+        pushdown_combine(
+            sources={"src": (tracker.lazy_frame, specs)},
+            combine=combine,
+        ).filter((pl.col("group1") == "A") & (pl.col("group2") == "B") & (pl.col("other") == "x")).collect()
+        analyzer = tracker.get_analyzer()
+        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("group")) == {"A", "B"}
+        assert analyzer.extract_discrete_values(analyzer.find_discrete_filter("other")) == {"x"}
+
+    def test_temporal_suppressed_column_excluded_from_union(self):
+        # A lookback spec on a source col suppresses that column's discrete membership; a second discrete
+        # spec on the SAME source col is then the only union member and pushes on its own.
+        df = pl.DataFrame(
+            {
+                "d": [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
+                "val": [1, 2, 3],
+            }
+        )
+        combine = lambda s: s["src"].rename({"d": "d1"}).join(
+            s["src"].select(pl.col("d").alias("d2")), how="cross"
+        )
+        specs = {
+            "d1": FilterSpec(source_col="d", lookback=timedelta(days=2)),
+            "d2": FilterSpec(source_col="d"),
+        }
+        tracker = PredicateTracker(df)
+        pushdown_combine(
+            sources={"src": (tracker.lazy_frame, specs)},
+            combine=combine,
+        ).filter((pl.col("d1") == date(2024, 1, 3)) & (pl.col("d2") == date(2024, 1, 2))).collect()
+        analyzer = tracker.get_analyzer()
+        # d1 is temporally suppressed (has lookback), so the discrete group for `d` has only d2 as a
+        # constrained member; a lone constrained member is unioned to itself -> pushes d == d2's value.
+        # The temporal (lookback) range filter for d1 is applied separately.
+        temporal = analyzer.find_temporal_filter("d")
+        assert temporal is not None  # lookback range was pushed
+        # d2's discrete equality is pushed as the single-member union.
+        f = analyzer.find_discrete_filter("d")
+        assert f is not None
+        assert analyzer.extract_discrete_values(f) == {date(2024, 1, 2)}
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

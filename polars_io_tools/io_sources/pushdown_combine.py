@@ -508,6 +508,27 @@ def pushdown_combine(
         2. combine() runs and creates ``region`` column from ``region_code``
         3. Original filter ``region == "NORTH_AMERICA"`` applied, ensuring correctness
 
+        **Shared source column (union of discrete filters):**
+
+        When multiple output columns map to the same ``source_col`` (e.g. a self-join that exposes
+        ``group1`` and ``group2`` from one ``group`` column), those output columns are *alternative*
+        consumers of the same source rows. Their discrete (``==`` / ``is_in``) filters are therefore
+        **unioned** into a single ``is_in`` on that source column rather than AND-intersected. If any
+        such output column is unconstrained by the query, the union is the full universe and **no
+        predicate is pushed** for that source column (the source must supply all candidate rows); the
+        original post-combine predicate still trims the output exactly.
+
+        Example: source column ``group`` shared by output columns ``group1`` and ``group2``::
+
+            sources={"src": (src_lf, {
+                "group1": FilterSpec(source_col="group"),
+                "group2": FilterSpec(source_col="group"),
+            })}
+
+        1. Filter ``group1 == "A" & group2 == "B"`` -> source receives ``group.is_in(["A", "B"])``
+        2. Filter ``group1 == "A"`` alone (group2 unconstrained) -> no ``group`` predicate is pushed
+        3. combine() runs and the original filter is applied, giving the exact requested pairs
+
     Examples:
         Basic usage with lookback::
 
