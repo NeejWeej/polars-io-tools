@@ -2620,12 +2620,21 @@ class TestSharedSourceColUnion:
                 "val": [1, 2, 3],
             }
         )
-        combine = lambda s: s["src"].rename({"d": "d1"}).join(s["src"].select(pl.col("d").alias("d2")), how="cross")
+
+        def combine(s):
+            return s["src"].rename({"d": "d1"}).join(s["src"].select(pl.col("d").alias("d2")), how="cross")
+
         specs = {
             "d1": FilterSpec(source_col="d", lookback=timedelta(days=2)),
             "d2": FilterSpec(source_col="d"),
         }
         tracker = PredicateTracker(df)
+        # NOTE: this test only asserts the pushed predicates (the suppression mechanism), not the
+        # end-to-end result. End-to-end this filter currently returns 0 rows but should return 1
+        # (d1=Jan3, d2=Jan2): the lookback range and the discrete d==Jan2 predicate AND on the shared
+        # source col `d`, starving the d1==Jan3 side of the cross-join. Mixed temporal+discrete sharing
+        # of one source_col still intersects rather than unions -- the documented limitation; see the
+        # pushdown_combine docstring Notes block.
         pushdown_combine(
             sources={"src": (tracker.lazy_frame, specs)},
             combine=combine,
