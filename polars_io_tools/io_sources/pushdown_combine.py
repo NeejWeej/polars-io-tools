@@ -219,6 +219,50 @@ def _apply_value_mapping(values: set[Any], mapping: dict | Callable | None) -> t
     return mapped, unmapped
 
 
+def _union_discrete_filter(
+    source_col: str,
+    members: list[tuple[str, FilterSpec]],
+    extracted_values: dict[str, set[Any] | None],
+) -> pl.Expr | None:
+    """Build a single discrete predicate for output columns sharing one ``source_col``.
+
+    When multiple output columns map to the same source column they are *alternative* consumers of the
+    same source rows, so a source row is relevant if it can serve *any* of them: the correct predicate
+    is the UNION of the per-member value sets, not their intersection (which AND-chaining would give).
+
+    Returns ``None`` (push nothing) if ANY member is:
+      - absent from ``extracted_values`` (unconstrained -> its universe is all rows, so the union is the
+        full universe and no predicate can narrow the scan), OR
+      - has an empty extracted set (mirrors the ``len(discrete_values) > 0`` guard), OR
+      - yields ``unmapped_values`` from its own ``spec.value_mapping`` (a partial dict mapping cannot be
+        safely pushed; defer to the post-combine predicate).
+
+    Otherwise returns ``pl.col(source_col) == v`` (union size 1) or
+    ``pl.col(source_col).is_in(list(union))`` (size > 1). Each member's values are mapped through that
+    member's own ``spec.value_mapping`` before unioning.
+    """
+    union: set[Any] = set()
+    for output_col, spec in members:
+        discrete_values = extracted_values.get(output_col)
+        if discrete_values is None or len(discrete_values) == 0:
+            log.debug(f"Column '{output_col}' unconstrained/empty; pushing nothing for source col '{source_col}'")
+            return None
+        mapped_values, unmapped_values = _apply_value_mapping(discrete_values, spec.value_mapping)
+        if unmapped_values:
+            log.debug(
+                f"Values {unmapped_values} for column '{output_col}' not found in value_mapping; "
+                f"pushing nothing for source col '{source_col}' (will be applied after combine)"
+            )
+            return None
+        union |= mapped_values
+
+    if len(union) == 1:
+        return pl.col(source_col) == next(iter(union))
+    # Do not sort: the union may contain unorderable values (e.g. None mixed with strings), and the
+    # single-member fast path uses an unsorted list(...) too. is_in does not require ordering.
+    return pl.col(source_col).is_in(list(union))
+
+
 # Endpoint comparison operators per ``closed`` mode. ``lower`` is the ``end_col >= lo`` side (left
 # endpoint of the request overlap); ``upper`` is the ``start_col <= hi`` side (right endpoint).
 _CLOSED_TO_LEFT = {"both": portion.CLOSED, "left": portion.OPEN, "right": portion.CLOSED, "none": portion.OPEN}
@@ -466,6 +510,37 @@ def pushdown_combine(
         2. combine() runs and creates ``region`` column from ``region_code``
         3. Original filter ``region == "NORTH_AMERICA"`` applied, ensuring correctness
 
+        **Shared source column (union of discrete filters):**
+
+        When multiple output columns map to the same ``source_col`` (e.g. a self-join that exposes
+        ``group1`` and ``group2`` from one ``group`` column), those output columns are *alternative*
+        consumers of the same source rows. Their discrete (``==`` / ``is_in``) filters are therefore
+        **unioned** into a single ``is_in`` on that source column rather than AND-intersected. If any
+        such output column is unconstrained by the query, the union is the full universe and **no
+        predicate is pushed** for that source column (the source must supply all candidate rows); the
+        original post-combine predicate still trims the output exactly.
+
+        Example: source column ``group`` shared by output columns ``group1`` and ``group2``::
+
+            sources={"src": (src_lf, {
+                "group1": FilterSpec(source_col="group"),
+                "group2": FilterSpec(source_col="group"),
+            })}
+
+        1. Filter ``group1 == "A" & group2 == "B"`` -> source receives ``group.is_in(["A", "B"])``
+        2. Filter ``group1 == "A"`` alone (group2 unconstrained) -> no ``group`` predicate is pushed
+        3. combine() runs and the original filter is applied, giving the exact requested pairs
+
+        This union applies to **discrete** (``==`` / ``is_in``) filters only. **Temporal** (date/datetime
+        range, ``lookback`` / ``lookahead``) specs that share a source column are still AND-**intersected**,
+        not unioned. This is intentional: unlike the discrete case, ``source_col`` sharing does not by
+        itself distinguish "alternative consumers" (which want a union) from "the same rows constrained
+        via several columns" (which want the intersection). ``ts_with_columns`` relies on the intersection
+        semantics (it maps ``index_col`` and every ``linked_col`` to one source column so the tightest
+        available constraint narrows the scan). As a result, two output *date* columns that share a source
+        column where one carries a ``lookback`` can intersect to an over-narrow (or empty) range; if you
+        need union-of-ranges semantics there, keep those columns on distinct source columns.
+
     Examples:
         Basic usage with lookback::
 
@@ -585,7 +660,12 @@ def pushdown_combine(
             filtered_lf = source_lf
             source_schema = source_schemas[source_name]
             empty_temporal_range = False
+            # Output columns whose discrete filter must be skipped because a temporal filter (or a bare
+            # Datetime source) already encodes the constraint. Built in Pass 1, consulted in Pass 2 so
+            # the discrete-union decision knows the per-column suppression before applying any filter.
+            suppressed: set[str] = set()
 
+            # Pass 1: interval and temporal filters (logic unchanged from the single-pass version).
             for output_col, spec in specs.items():
                 # Interval specs reference two source columns and push an overlap predicate; handle them
                 # separately from the single-column FilterSpec path below.
@@ -602,10 +682,6 @@ def pushdown_combine(
                     continue
 
                 source_dtype = source_schema[source_col]
-
-                # Track whether we applied a temporal filter with expansion. If so, we skip the discrete filter for this
-                # column (it would undo the lookback/lookahead expansion).
-                applied_temporal_with_expansion = False
 
                 # Apply temporal filter with lookback/lookahead
                 if output_col in extracted_ranges:
@@ -645,18 +721,40 @@ def pushdown_combine(
                             # get pushed down to the underlying source.
                             empty_temporal_range = True
                             log.debug(f"Empty temporal range for {source_name}.{source_col}, will apply head(0) after filters")
-                            applied_temporal_with_expansion = has_expansion or isinstance(source_dtype, pl.Datetime)
+                            # Skip the discrete filter for this column (it would undo the lookback/lookahead
+                            # expansion; also skip unconditionally for bare Datetime sources).
+                            if has_expansion or isinstance(source_dtype, pl.Datetime):
+                                suppressed.add(output_col)
                         elif temporal_filter is not None:
                             filtered_lf = filtered_lf.filter(temporal_filter)
                             log.debug(f"Applied temporal filter to {source_name}.{source_col}: {temporal_filter}")
-                            applied_temporal_with_expansion = has_expansion or isinstance(source_dtype, pl.Datetime)
+                            if has_expansion or isinstance(source_dtype, pl.Datetime):
+                                suppressed.add(output_col)
 
-                # Apply discrete filter with value mapping
-                # Skip for temporal columns if we already applied an expanded temporal filter (the discrete filter would
-                # undo the lookback/lookahead expansion). Also skip for Datetime sources unconditionally: the temporal
-                # filter already encodes the constraint with full-day widening for date literals, and a discrete filter
-                # would re-promote date values to midnight and silently drop intraday rows.
-                if output_col in extracted_values and not applied_temporal_with_expansion:
+            # Pass 2: discrete filters, grouped by resolved source column so that multiple output columns
+            # sharing one source column union their value sets (rather than AND-intersecting).
+            #
+            # Skip for columns suppressed in Pass 1 (their constraint is already encoded temporally, and a
+            # discrete filter would undo the lookback/lookahead expansion or re-promote date values on a
+            # Datetime source and silently drop intraday rows).
+            # Group ALL sharers of a source column together, regardless of whether each is individually
+            # constrained. A sharer that is absent from extracted_values (unconstrained) must still count
+            # as a member so the union rule can see it and push nothing (its universe is all rows).
+            by_source_col: dict[str, list[tuple[str, FilterSpec]]] = {}
+            for output_col, spec in specs.items():
+                if isinstance(spec, IntervalFilterSpec) or output_col in suppressed:
+                    continue
+                source_col = _get_source_col(output_col, spec)
+                if source_col not in source_schema:
+                    continue
+                by_source_col.setdefault(source_col, []).append((output_col, spec))
+
+            for source_col, members in by_source_col.items():
+                if len(members) == 1:
+                    # Single-member fast path: byte-identical to the pre-refactor discrete branch.
+                    output_col, spec = members[0]
+                    if output_col not in extracted_values:
+                        continue
                     discrete_values = extracted_values[output_col]
                     if discrete_values is not None and len(discrete_values) > 0:
                         mapped_values, unmapped_values = _apply_value_mapping(discrete_values, spec.value_mapping)
@@ -680,6 +778,13 @@ def pushdown_combine(
                             # All values mapped, safe to push down is_in filter
                             filtered_lf = filtered_lf.filter(pl.col(source_col).is_in(list(mapped_values)))
                             log.debug(f"Applied is_in filter to {source_name}.{source_col}: {mapped_values}")
+                else:
+                    # Multiple output columns share this source column: push the UNION of their value sets,
+                    # or nothing if any sharer is unconstrained/unmappable (see _union_discrete_filter).
+                    union_filter = _union_discrete_filter(source_col, members, extracted_values)
+                    if union_filter is not None:
+                        filtered_lf = filtered_lf.filter(union_filter)
+                        log.debug(f"Applied union discrete filter to {source_name}.{source_col}: {union_filter}")
 
             if empty_temporal_range:
                 filtered_lf = filtered_lf.head(0)
