@@ -383,8 +383,10 @@ def filtered_join_asof(
         n_rows: int | None,
         batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
-        nonlocal lf1
-        nonlocal lf2
+        # Each collection gets its own filtered plans. Keeping them local prevents a
+        # previous query's predicate from narrowing later collections of this source.
+        left_lf = lf1
+        right_lf = lf2
         right_filters_from_by = None
         parsed_predicate = get_parsed_expr(predicate) if predicate is not None else None
         with_columns_set = set(with_columns) if with_columns is not None else None
@@ -398,7 +400,7 @@ def filtered_join_asof(
                 if full_left_predicate is not None:
                     # If we have a predicate, we can push it down to the left lazyframe
                     # We only do so if polars does not
-                    lf1 = lf1.filter(full_left_predicate)
+                    left_lf = left_lf.filter(full_left_predicate)
 
                 if by_left is not None and by_right is not None:
                     # If we have set by_left and by_right, then we can, additionally, push down filters
@@ -425,7 +427,7 @@ def filtered_join_asof(
                 else:
                     right_filters_from_by = None
 
-            lf2 = lf2.filter(right_filters_from_by) if right_filters_from_by is not None else lf2
+            right_lf = right_lf.filter(right_filters_from_by) if right_filters_from_by is not None else right_lf
             right_extended_filters = []
             empty_interval = False
 
@@ -473,16 +475,18 @@ def filtered_join_asof(
 
             if right_extended_filters:
                 # Apply temporal filters first so they get pushed down unobstructed.
-                lf2 = lf2.filter(pl.all_horizontal(*right_extended_filters) if len(right_extended_filters) > 1 else right_extended_filters[0])
+                right_lf = right_lf.filter(
+                    pl.all_horizontal(*right_extended_filters) if len(right_extended_filters) > 1 else right_extended_filters[0]
+                )
 
             if empty_interval:
                 # Empty interval — no right-side rows can match.
                 # Applied after filters so the temporal bounds still act as a
                 # safety net if head(0) doesn't get pushed down to the source.
-                lf2 = lf2.head(0)
+                right_lf = right_lf.head(0)
 
-        lf_joined = lf1.join_asof(
-            lf2,
+        lf_joined = left_lf.join_asof(
+            right_lf,
             **kwargs,  # type: ignore[arg-type]
         )
 
