@@ -135,6 +135,30 @@ def test_from_narwhals_with_predicate_pushdown():
     assert_frame_equal(result, POLARS_ANSWER)
 
 
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        pl.col("x").ne_missing(1),
+        pl.col("x").eq_missing(pl.col("y")),
+        pl.col("x").ne_missing(pl.col("y")),
+        pl.col("x").is_in([None, 1], nulls_equal=True),
+        pl.col("x").is_in([1], nulls_equal=True).eq_missing(False),
+        pl.col("x").is_in(None, nulls_equal=True),
+        pl.col("x").is_in(1, nulls_equal=True),
+    ],
+)
+def test_from_narwhals_null_aware_predicate_matches_polars(predicate: pl.Expr):
+    source = pa.table({"id": [0, 1, 2, 3], "x": [None, 1, 2, None], "y": [None, 1, None, 2]})
+    expected = pl.from_arrow(source).filter(predicate)
+    nw_source = nw.from_native(source).lazy()
+    translated = polars_to_nw(predicate)
+    assert translated is not None
+    assert nw_source.filter(translated).collect().to_arrow()["id"].to_pylist() == expected["id"].to_list()
+
+    actual = cpl.from_narwhals(nw_source).filter(predicate).collect()
+    assert_frame_equal(actual, expected)
+
+
 def test_from_narwhals_custom_batch_size():
     """Test that `from_narwhals` correctly handles custom batch size parameter"""
 
