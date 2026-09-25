@@ -259,8 +259,8 @@ def scan_narwhals(obj: Any, fetch_size: int, description: str | None = None) -> 
             raise RuntimeError(err_msg) from e
 
         pl_df: pl.DataFrame
-        if nw_df.implementation == nw.Implementation.PANDAS:
-            # A filtered pandas frame may have a non-RangeIndex; converting it
+        if nw_df.implementation in (nw.Implementation.PANDAS, nw.Implementation.MODIN, nw.Implementation.CUDF):
+            # Filtered pandas-like frames may have a non-RangeIndex; converting
             # through Arrow would turn that index into an extra data column.
             pl_df = nw_df.to_polars()
         else:
